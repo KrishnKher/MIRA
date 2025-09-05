@@ -1,1 +1,1 @@
-# MIRA
+# MIRA: Memory Integrated Reconfigurable Adapters
