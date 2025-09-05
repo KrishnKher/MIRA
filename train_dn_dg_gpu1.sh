@@ -1,0 +1,6 @@
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 0 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 1 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 2 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 3 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 4 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2
+CUDA_VISIBLE_DEVICES=1 python train_generalizer_from_list_openclip.py --infer_after 2000 --test_domain 5 --dataset DomainNet --num_classes 345 --epochs 1 --lr 7e-4 --batch_size 128 --adapters_per_domain=2

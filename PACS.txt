@@ -1,0 +1,4 @@
+art_painting: 97.85
+cartoon: 98.81
+sketch: 91.89
+photo: 99.44

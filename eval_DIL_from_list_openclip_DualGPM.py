@@ -1,0 +1,1002 @@
+from datasets import load_dataset
+from transformers import ViTFeatureExtractor, AutoModel
+from modeling_vit import ViTForImageClassification, ViTSelfAttention
+
+from transformers import ViTFeatureExtractor, ViTForImageClassification as ViT_Pretrained
+from transformers import TrainingArguments, Trainer
+from open_clip_vit import VisionTransformer, MultiheadAttention, to_dist
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision.transforms import *
+from scipy.stats import ttest_ind
+
+from progbar import Progbar
+from copy import deepcopy
+import numpy as np
+import open_clip
+import argparse
+import os
+from localdatasets import make_VLCS, make_TI
+from itertools import chain
+from avalanche.benchmarks.classic import SplitCIFAR100, SplitTinyImageNet, SplitCUB200, SplitImageNet
+from custom_datasets import SplitImageNetR
+import math
+from vil_datasets import build_continual_dataloader
+import pickle as pkl
+import time
+import random
+import re
+from typing import Optional
+from torch import Tensor
+from peft import LoraConfig, get_peft_model
+
+
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset", type=str, default="DomainNet-dil")
+parser.add_argument("--adapters_per_domain", type=int, default=3)
+parser.add_argument("--epochs", type=int, default=5)
+parser.add_argument("--later_epochs", type=int, default=None)
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--num_classes", type=int, default=345)
+parser.add_argument("--base_model", type=str, default='laion', choices=['laion', 'vit-in21k'])
+parser.add_argument("--name_tag", type=str, default='')
+parser.add_argument("--infer_after", type=int, default=2000)
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--seed', type=int, default=None)
+parser.add_argument('--dgm_th', type=float, default=0.7)
+parser.add_argument('--separation_function', type=str, default='softmax')
+args = parser.parse_args()
+
+if args.separation_function == 'affine' or args.separation_function is None:
+    args.separation_function = to_dist
+elif args.separation_function == 'softmax':
+    args.separation_function = F.softmax
+elif args.separation_function == 'relu':
+    args.separation_function = lambda x, dim: F.relu(x)
+elif args.separation_function == 'sigmoid':
+    args.separation_function = lambda x, dim: torch.sigmoid(x)
+elif args.separation_function == 'tanh':
+    args.separation_function = lambda x, dim: torch.tanh(x)
+
+
+class DualGPM:
+    """
+    Dual Gradient Projection Memory (DualGPM) for continual learning,
+    now supporting:
+      - A classifier whose #rows (classes) grows over time.
+      - A MultiheadAttention with hopfield_keys whose #rows (keys) grows.
+    We project EACH ROW of those parameters through a fixed basis
+    of dimension d (the embedding dim), so row‐count can change freely.
+    """
+    def __init__(self,
+                 backbone: nn.Module,
+                 classifier: nn.Linear,
+                 eps_th: float = 0.9):
+        self.backbone   = backbone
+        self.classifier = classifier
+        self.eps_th     = eps_th
+
+        # memories[module] = {'basis': M (d×k), 'is_Ml': bool}
+        self.memories = {}
+
+        # Register every MultiheadAttention by its key‐dim D:
+        for m in backbone.modules():
+            if isinstance(m, MultiheadAttention):
+                D = m.hopfield_keys.size(-1)   # dim of each key‐vector
+                self.memories[m] = {
+                    'basis': torch.empty(D, 0),
+                    'is_Ml': True
+                }
+                if not isinstance(m.hopfield_query_generator, nn.Identity):
+                    for l in m.hopfield_query_generator.modules():
+                        if isinstance(l, nn.Linear):
+                            D = l.weight.size(1)
+                            self.memories[l] = {
+                                'basis': torch.empty(D, 0),
+                                'is_Ml': True
+                            }
+
+        # Register the classifier (row‐dim = in_features)
+        D = classifier.in_features
+        self.memories[classifier] = {
+            'basis': torch.empty(D, 0),
+            'is_Ml': True
+        }
+
+    def update(self, dataloader):
+        """
+        Collect one batch of inputs per registered module,
+        then expand/reduce each basis via SVD (Eqs. 5–8).
+        """
+        # 1) Hook each module to grab its input features R ∈ ℝ^{d×N}
+        inputs = {m: [] for m in self.memories}
+        hooks = []
+        for m in inputs:
+            def hook_fn(mod, inp, out, m=m):
+                x = inp[0].detach()
+                # For attention: x.shape = [B, S, D] → [D, B·S]
+                if x.ndim == 3:
+                    B,S,D = x.shape
+                    x = x.reshape(B*S, D)
+                # For classifier: x.shape = [B, D]
+                inputs[m].append(x.T)
+            hooks.append(m.register_forward_hook(hook_fn))
+
+        # 2) Run one forward pass
+        self.backbone.eval()
+        with torch.no_grad():
+            for data in dataloader:
+                feats = self.backbone(data['image'].cuda())
+                _     = self.classifier(feats)
+                break
+
+        # remove hooks
+        for h in hooks:
+            h.remove()
+
+        # 3) Expand or reduce each basis
+        for m, mem in self.memories.items():
+            R       = torch.cat(inputs[m], dim=1)  # [d×N]
+            M, flag = mem['basis'], mem['is_Ml']
+
+            if flag:
+                M_new, new_flag = self._expand_Ml(M, R)
+            else:
+                M_new, new_flag = self._reduce_Mperp(M, R)
+
+            mem['basis'] = M_new
+            mem['is_Ml'] = new_flag
+
+    def project(self):
+        """
+        For each registered module, project its gradient **row‐wise**:
+         - Classifier.weight: shape [C, D]
+         - hopfield_keys:      shape [K, D]
+        Other parameters (e.g. linear/conv weights) are still
+        flattened as before if you register them.
+        """
+        for m, mem in self.memories.items():
+            M, flag = mem['basis'], mem['is_Ml']
+
+            # --- Classifier: row‐wise on [C×D] --- #
+            if m is self.classifier:
+                G = m.weight.grad  # [C, D]
+                # print(G.shape, M.shape)
+                # exit()
+                if G is None or M.numel()==0:
+                    continue
+                # (G @ M) is [C,k], then @Mᵀ → [C,D]
+                if flag:
+                    Gp = G - (G @ M) @ M.T
+                else:
+                    Gp = (G @ M) @ M.T
+                m.weight.grad.copy_(Gp)
+                continue
+
+            # --- MultiheadAttention hopfield_keys: row‐wise on [K×D] --- #
+            if isinstance(m, MultiheadAttention):
+                Gk = m.hopfield_keys.grad  # [K, D]
+                if Gk is None or M.numel()==0:
+                    continue
+                if flag:
+                    Gp = Gk - ((Gk.T @ M) @ M.T).T
+                else:
+                    Gp = (Gk @ M) @ M.T
+                m.hopfield_keys.grad.copy_(Gp)
+                continue
+            
+            if isinstance(m, nn.Linear):
+                # --- Linear: row‐wise on [C×D] --- #
+                G = m.weight.grad
+                if G is None or M.numel()==0:
+                    continue
+                if flag:
+                    Gp = G - (G @ M) @ M.T
+                else:
+                    Gp = (G @ M) @ M.T
+                m.weight.grad.copy_(Gp)
+                continue
+
+            # --- Fallback: flatten-vector (if you ever register others) --- #
+            w = m.weight if not isinstance(m, nn.ParameterList) else m
+            g = w.grad.reshape(-1,1)
+            if g.numel()==0 or M.numel()==0:
+                continue
+            if flag:
+                gp = g - M @ (M.T @ g)
+            else:
+                gp = M @ (M.T @ g)
+            w.grad.copy_(gp.view_as(w))
+
+    def _expand_Ml(self, M, R):
+        # Eq. (5–6) expansion
+        R_proj = M @ (M.T @ R) if M.numel() else torch.zeros_like(R)
+        R_hat  = R - R_proj
+        U, S, _ = torch.linalg.svd(R_hat, full_matrices=False)
+
+        E_tot  = (R**2).sum()
+        E_proj = (R_proj**2).sum()
+        E_cum  = torch.cumsum(S**2, dim=0)
+
+        req = self.eps_th * E_tot - E_proj
+        u   = int(torch.searchsorted(E_cum, req, right=False).item()) + 1
+
+        # print("@@@@@@@@@")
+        # print(M.shape)
+        M_new = torch.cat([M, U[:, :u]], dim=1) if M.numel() else U[:, :u]
+        # print(M_new.shape)
+        # print("@@@@@@@@@")
+
+        d, k = R.shape[0], M_new.shape[1]
+        if k > d - k:
+            # take nullspace columns k…d
+            U_all, _, _ = torch.linalg.svd(M_new, full_matrices=True)
+            return U_all[:, k:], False
+        return M_new, True
+
+    def _reduce_Mperp(self, M, R):
+        # Eq. (7–8) reduction
+        R_hat_p = M @ (M.T @ R)
+        U_p, S_p, _ = torch.linalg.svd(R_hat_p, full_matrices=False)
+
+        E_cum_p = torch.cumsum(S_p**2, dim=0)
+        thr     = (1 - self.eps_th) * (R**2).sum()
+        k       = int((E_cum_p <= thr).sum().item())
+
+        Z       = U_p[:, :k]
+        M_hat   = M - Z @ (Z.T @ M)
+        U_e, S_e, _ = torch.linalg.svd(M_hat, full_matrices=False)
+
+        nz    = (S_e.abs() > 1e-12)
+        M_new = U_e[:, nz]
+
+        d, p = R.shape[0], M_new.shape[1]
+        if (d - p) < p:
+            # take nullspace of M_perp: columns p…d  
+            U_all, _, _ = torch.linalg.svd(M_new, full_matrices=True)
+            return U_all[:, p:], True
+        return M_new, False
+
+
+if args.base_model == 'laion':
+    laion, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K')
+    vit = laion.visual.cuda()
+
+
+
+
+
+    def load_laion_weights(vit, laion_vit):
+        vit_state_dict = vit.state_dict()
+        laion_vit_state_dict = laion_vit.state_dict()
+        for n, p in vit_state_dict.items():
+            if n in laion_vit_state_dict:
+                vit_state_dict[n] = laion_vit_state_dict[n]
+
+        vit.load_state_dict(vit_state_dict)
+        
+
+
+elif args.base_model == 'vit-in21k':
+    model_string = 'google/vit-base-patch16-224-in21k'
+    preprocess_train = ViTFeatureExtractor.from_pretrained(model_string)
+    preprocess_val = preprocess_train
+
+dataset_name = args.dataset
+is_hf_dataset = True
+if dataset_name == "PACS":
+    dataset = load_dataset("flwrlabs/pacs")
+    train_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
+elif dataset_name == "DomainNet":
+    dataset = load_dataset("wltjr1007/DomainNet")
+    train_domains = [0, 1, 2, 3, 4, 5]
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet.pt')
+elif dataset_name == "OfficeHome":
+    dataset = load_dataset("flwrlabs/office-home")
+    train_domains = ['Art', 'Clipart', 'Product', 'Real World']
+elif dataset_name == "VLCS":
+    train_domains = ['Caltech101', 'LabelMe', 'SUN09', 'VOC2007']
+    try:
+        dataset = load_dataset("ai22mtech12002/DG_VLCS")
+    except:
+        dataset = make_VLCS('data/VLCS')
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_VLCS.pt')
+elif dataset_name == "TI":
+    try:
+        dataset = load_dataset("ai22mtech12002/DG_TI")
+    except:
+        dataset = make_TI('data/terra_incognita')
+    train_domains = ['location_38', 'location_43', 'location_46', 'location_100']
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_TI.pt')
+elif dataset_name == "DN4IL":
+    train_domains = ["real", "clipart", "infograph", "painting", "quickdraw", "sketch"] 
+    dataset = load_dataset("ai22mtech12002/DN4IL")
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DN4IL.pt')
+elif dataset_name == "CDDB":
+    train_domains = ['gaugan', 'biggan' , 'wild', 'whichfaceisreal', 'san']
+    dataset = load_dataset("ai22mtech12002/CDDB-hard")
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_CDDB.pt')
+elif dataset_name == "iDigits-dil":
+    args.num_tasks = 4
+    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/iDigits'
+    args.task_type = 'dil'
+    args.shuffle = True
+    args.versatile_inc = False
+    args.num_workers = 8
+    args.pin_mem = True
+    preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+    preprocess_val = Compose([
+            Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop((224, 224)),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+    dataloaders, _, _ = build_continual_dataloader(args=args)
+    train_domains = list(range(args.num_tasks))
+    is_hf_dataset = False
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_iDigits-dil.pt')
+elif dataset_name == "CORe50-dil":
+    args.num_tasks = 8
+    args.data_path = '/data1/ai22mtech12002/projects/WeightDG/data/Core50-dil'
+    args.task_type = 'dil'
+    args.shuffle = True
+    args.versatile_inc = False
+    args.num_workers = 8
+    args.pin_mem = True
+    preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+    preprocess_val = Compose([
+            Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop((224, 224)),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+    dataloaders, _, _ = build_continual_dataloader(args=args)
+    train_domains = list(range(args.num_tasks))
+    is_hf_dataset = False
+    adapter_list = torch.load('/data1/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_CORe50-dil.pt')
+elif dataset_name == "DomainNet-dil":
+    args.num_tasks = 6
+    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/DomainNet-dil'
+    args.task_type = 'dil'
+    args.shuffle = True
+    args.versatile_inc = False
+    args.num_workers = 8
+    args.pin_mem = True
+    if args.base_model == 'vit-in21k':
+        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
+        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
+        eval_resize = 256
+        eval_crop = 224
+        preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224),
+                            scale=(0.9, 1.0),
+                            ratio=(0.75, 1.3333),
+                            interpolation=InterpolationMode.BICUBIC,
+                            antialias=True),
+            ToTensor(),                          
+            Normalize(mean=img_mean, std=img_std)
+        ])
+        preprocess_val = Compose([
+            Resize(size=(eval_resize, eval_resize),
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True),
+            CenterCrop((eval_crop, eval_crop)),
+            ToTensor(),
+            Normalize(mean=img_mean, std=img_std)
+        ])
+    else:
+        preprocess_train = Compose([
+                RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
+                ToTensor(),
+                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+            ])
+        preprocess_val = Compose([
+                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+                CenterCrop((224, 224)),
+                ToTensor(),
+                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+            ])
+    dataloaders, _, _ = build_continual_dataloader(args=args)
+    train_domains = list(range(args.num_tasks))
+    is_hf_dataset = False
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt')
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_stage1_saksham_1.pt', weights_only=False)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom.pt')
+    # print("ADapter list", adapter_list)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt')
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/shared_adapters_list_laion_DomainNet-dil_peft_saksham_shared_with_model.pt')
+    
+# CIL Datasets
+elif args.dataset == "cifar100":
+    fixed_order = list(range(100))
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        fixed_order = np.random.permutation(fixed_order)
+    num_classes=args.num_classes
+    num_tasks = 100 // num_classes
+    train_domains = list(range(num_tasks))
+    assert 100 % num_classes == 0, "num_classes should be divisible by 100"
+    benchmark = SplitCIFAR100(num_tasks, return_task_id=False, class_ids_from_zero_in_each_exp=True, fixed_class_order=fixed_order)
+    is_hf_dataset = False
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_cifar100.pt')
+
+elif args.dataset == "tinyimagenet":
+    fixed_order = list(range(200))
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        fixed_order = np.random.permutation(fixed_order)
+    num_classes=args.num_classes
+    num_tasks = 200 // num_classes
+    train_domains = list(range(num_tasks))
+    assert 200 % num_classes == 0, "num_classes should be divisible by 200"
+    benchmark = SplitTinyImageNet(num_tasks, return_task_id=True, class_ids_from_zero_in_each_exp=True, fixed_class_order=fixed_order)
+    is_hf_dataset = False
+
+elif args.dataset == "cub":
+    fixed_order = list(range(200))
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        fixed_order = np.random.permutation(fixed_order)
+    num_classes=args.num_classes
+    num_tasks = 200 // num_classes
+    train_domains = list(range(num_tasks))
+    assert 200 % num_classes == 0, "num_classes should be divisible by 200"
+    benchmark = SplitCUB200(num_tasks, return_task_id=True, fixed_class_order=fixed_order)
+    is_hf_dataset = False
+
+elif args.dataset == "inetR":
+    fixed_order = list(range(200))
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        fixed_order = np.random.permutation(fixed_order)
+    num_classes=args.num_classes
+    num_tasks = 200 // num_classes
+    train_domains = list(range(num_tasks))
+    assert 200 % num_classes == 0, "num_classes should be divisible by 200"
+    benchmark = SplitImageNetR(dataset_root='/data/ai22mtech12002/projects/GlobalMemCL', n_experiences=num_tasks, return_task_id=True, fixed_class_order=fixed_order)
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_inetR.pt')
+
+    is_hf_dataset = False
+
+
+# laion, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K')
+# vit = laion.visual.cuda()
+
+
+
+
+
+# model = VisionTransformer(
+#     224, 16, 768, 12, 12, 4
+# ).cuda()
+# # classifier = nn.Linear(512, args.num_classes, bias=False).cuda()
+# load_laion_weights(model, vit)
+
+adapters_per_domain = args.adapters_per_domain
+epochs = args.epochs
+batch_size = args.batch_size
+num_classes = args.num_classes
+parent_dir = f'data/{dataset_name}'
+os.makedirs(parent_dir, exist_ok=True)
+
+
+
+
+# classifier = nn.Linear(512, num_classes).cuda()
+# # schd = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-3)
+criterion = nn.CrossEntropyLoss()
+# first_accs = {}
+
+
+class DomainDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, preprocess, returns_domain=True, label_offset = None):
+        self.dataset = dataset
+        self.preprocess = preprocess
+        self.label_offset = label_offset
+        self.returns_domain = returns_domain
+        # if not is_hf_dataset:
+        #     if args.base_model == 'vit-in21k':
+        #         self.vit_preprocess = Compose([
+        #                 Resize(256),
+        #                 RandomCrop(224),
+        #                 RandomHorizontalFlip(0.5),
+        #                 Normalize(preprocess.image_mean, preprocess.image_std)
+        #             ])
+        #     else:
+        #         self.preprocess = Compose([
+        #                 Resize(256),
+        #                 RandomCrop(224),
+        #                 RandomHorizontalFlip(0.5),
+        #                 Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        #             ])
+            
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        # print(list(item['image'].keys()))
+        # item['image'].verify()
+        if is_hf_dataset:
+            if args.base_model == 'vit-in21k':
+                item['image'] = self.vit_preprocess(item['image'])
+            else:
+                item['image'] = self.preprocess(item['image'])
+            return {'image': item['image'], 'label': item['label']}
+        else:
+            if self.returns_domain:
+                image, label, _ = item
+            else:
+                image, label = item
+            item = {}
+            if args.base_model == 'vit-in21k':
+                item['image'] = self.preprocess(image)
+            else:
+                item['image'] = self.preprocess(image)
+            item['label'] = (label - self.label_offset) if self.label_offset is not None else label
+            return item
+
+
+# Function to implement mixup, mixing different parts from all images in the batch
+def mixup(image_batch, mixup_times=1):
+    alpha = 0.4
+    for i in range(mixup_times):
+        lam = np.random.beta(alpha, alpha)
+        rand_perm = torch.randperm(image_batch.size(0))
+        image_batch = lam * image_batch + (1 - lam) * image_batch[rand_perm]
+    return image_batch
+
+
+@torch.no_grad()
+def eval():
+    vit.eval()
+    domain_accs = {}
+    domain_indices = list(range(len(test_domain_loaders)))
+    random.shuffle(domain_indices)
+
+# Function to get a unique random domain index
+    def get_unique_random_domain():
+        if not domain_indices:
+            raise ValueError("No more domains left to sample.")
+        return domain_indices.pop()
+
+    
+    for domain_idx, test_loader in enumerate(test_domain_loaders):
+        # rand_domain = get_unique_random_domain()
+        weight_dict = list_model[domain_idx]
+        set_peft_lora_weights(weight_dict)
+        # set_peft_lora_weights_hf_vit(weight_dict)
+        # set_store_dict(vit, weight_dict)
+        
+        
+        pbar = Progbar(len(test_loader))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # vit.to(device)
+        for step, batch in enumerate(test_loader):
+            pixel_values = batch["image"].cuda()
+            labels = batch['label'].cuda()
+            if args.base_model == 'vit-in21k':
+                out = vit(pixel_values)
+                outputs = out.logits
+            else:
+                outputs = classifier(vit(pixel_values))
+            loss = criterion(outputs, labels)
+
+            acc = (outputs.argmax(dim=1) == labels).float().mean().item()
+            pbar.update(step + 1, values=[("loss", loss.item()), ("acc", acc)])
+        domain_accs[domain_idx] = pbar.get_values()['acc']
+        if args.dataset == 'CORe50-dil':
+            return domain_accs
+    return domain_accs
+
+
+
+test_domain_loaders = []
+vit_hopfield_keys = []
+dualGPM = None
+
+for domain_idx, domain in enumerate(train_domains):
+    if args.dataset in ['iDigits-dil', 'CORe50-dil', 'DomainNet-dil']:
+        dl = dataloaders[domain]
+        train_dataset = dl['train']
+        train_dataset = DomainDataset(train_dataset, preprocess_train, returns_domain=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+        test_dataset = dl['test']
+        test_dataset = DomainDataset(test_dataset, preprocess_val, returns_domain=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+        print(f"Training samples for domain {domain}: {len(train_dataset)}")
+        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
+    elif is_hf_dataset:
+        train_dataset = dataset.filter(lambda x: x['domain'] == domain)
+        try:
+            train_dataset = train_dataset['train']
+        except KeyError:
+            pass  
+        
+        train_dataset = DomainDataset(train_dataset, preprocess_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+
+        test_dataset = dataset.filter(lambda x: x['domain'] == domain)
+        try:
+            test_dataset = test_dataset['test']
+        except KeyError:
+            try:
+                test_dataset = test_dataset['train']
+            except:
+                pass
+        test_dataset = DomainDataset(test_dataset, preprocess_val)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+    else:
+        train_dataset = list(benchmark.train_stream)[domain_idx].dataset
+        print(f"Training samples for domain {domain}: {len(train_dataset)}")
+        train_dataset = DomainDataset(train_dataset, preprocess_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+
+        test_dataset = list(benchmark.test_stream)[domain_idx].dataset
+        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
+        test_dataset = DomainDataset(test_dataset, preprocess_val)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+    
+
+    # keys, train_module_params = make_hopfield(vit, domain)
+    # keys = get_model_keys(model)
+    # key_nets = get_model_key_nets(model)
+
+    # if dualGPM is None:
+    #     dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
+    
+    # model_hopfield_keys = keys
+    # total_params = 0
+    # for p in model_hopfield_keys + train_module_params:
+    #     total_params += p.numel()
+    # print(f"Total params: {total_params}")
+    # opt = optim.AdamW(keys + train_module_params + key_nets + list(classifier.parameters()), lr=args.lr, weight_decay=1e-2)
+
+    # epochs = args.epochs if (args.later_epochs is None or domain_idx == 0) else args.later_epochs
+    # prev_keys = None
+
+import pickle as pkl
+
+
+# model = pkl.load(open(f'{parent_dir}/{args.base_model}_{args.dataset}_{args.name_tag}.pkl', 'rb'))
+list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dilsaksham_stage1_2808_with_hopfield.pt', weights_only = False)
+# list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt', weights_only = False)
+# list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_vit-in21k_DomainNet-dil_peft_saksham_lora_vit21_98.pt', weights_only = False)
+# # print(len(list_model), type(list_model[0]))
+# print(model)
+# weight_dict = list_model[0]
+# print(model[0])
+# print(model)
+# set_peft_lora_weights(model, model_weights)
+
+# print("a", a)
+# list_classifier = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_vit-in21k_DomainNet-dil_peft_saksham_lora_vit21_98.pt', weights_only = False)
+# list_classifier = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt', weights_only = False)
+list_classifier = torch.load(f'data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_laion_DomainNet-dil.pt', weights_only = False)
+classifier = list_classifier[0]
+print(classifier)
+# classifier = pkl.load(open(f'{parent_dir}/{args.base_model}_{args.dataset}_{args.name_tag}_classifier.pkl', 'rb'))
+# print(get_model_keys(model))
+# set_random_keys(model)
+# print(get_model_keys(model))
+
+        
+
+# with torch.no_grad():
+#     dummy_input = torch.randn(10, 1, 3, 224, 224).cuda()
+#     for i in range(10):
+#         start = time.time()
+#         _ = model(dummy_input[i])
+#         end = time.time()
+#         print(f"Time taken for forward pass {i+1}: {end - start:.4f} seconds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################################
+def replace_layers(model, trainable, freeze_base=None, freeze_linear_base=None, freeze_lnorm=False):
+    # print(model)
+    for n, module in model.named_children():
+        if len(list(module.children())) > 0:
+            ## compound module, go inside it
+            replace_layers(module, trainable, freeze_base, freeze_linear_base)
+
+        if isinstance(module, nn.MultiheadAttention):
+            # print(model)
+            # print(module)
+            # exit(0)
+            # assert False, "MultiheadAttention should not be used in this script, use CustomAttention instead"
+            setattr(model, n, CustomAttention(
+                embed_dim=768,
+                num_heads=12,
+                bias=module.in_proj_bias is not None,
+                batch_first=True,  
+                in_proj_weight=module.in_proj_weight,
+                in_proj_bias=module.in_proj_bias,
+                out_proj=module.out_proj
+
+            ))
+
+
+class CustomAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        bias=True,
+        batch_first=False,
+        in_proj_weight=None,
+        in_proj_bias=None,
+        out_proj=None,
+        **kwargs
+    ):
+        super().__init__()
+        print("REPLACING###########################")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+        self.batch_first = batch_first
+
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # assert False
+        assert in_proj_weight is not None
+        if in_proj_weight is not None:
+            assert in_proj_weight.shape == (3 * embed_dim, embed_dim)
+            q_w, k_w, v_w = in_proj_weight.chunk(3, dim=0)
+            print("CALEED###################")
+            self.q_proj.weight.data = q_w
+            self.k_proj.weight.data = k_w
+            self.v_proj.weight.data = v_w
+
+        if in_proj_bias is not None:
+            assert in_proj_bias.shape == (3 * embed_dim,)
+            q_b, k_b, v_b = in_proj_bias.chunk(3, dim=0)
+            self.q_proj.bias.data = q_b
+            self.k_proj.bias.data = k_b
+            self.v_proj.bias.data = v_b
+
+        self.out_proj = out_proj if out_proj is not None else nn.Linear(embed_dim, embed_dim, bias=bias)
+        
+        
+        #Add bias in forward also
+        #FIrst use replace layers, then use peft model
+        
+        #USe method of replace layers to convert MHA to Custom attention
+        
+        # self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def forward(
+        self,
+        query=None,
+        key=None,
+        value=None,
+        # q_x=None,
+        # k_x=None,
+        # v_x=None,
+        q_bias: Optional[Tensor] = None,
+        k_bias: Optional[Tensor] = None,
+        v_bias: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[Tensor] = None,
+        average_attn_weights: bool = True,
+        is_causal: bool = False,
+        **kwargs
+    ):
+        query = query if query is not None else kwargs.get("q_x", None)
+        key = key if key is not None else kwargs.get("k_x", None)
+        value = value if value is not None else kwargs.get("v_x", None)
+
+        if query is None or key is None or value is None:
+            raise ValueError("CustomAttention expects either (query, key, value) or (q_x, k_x, v_x) to be passed.")
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        if q_bias is not None:
+            q = q + q_bias
+        if k_bias is not None:
+            k = k + k_bias
+        if v_bias is not None:
+            v = v + v_bias
+
+        scale = self.head_dim ** -0.5
+        h = self.num_heads
+        d = self.head_dim
+
+        if self.batch_first:
+            # [B, S, E]
+            B, S, E = q.shape
+            q = q.view(B, S, h, d).transpose(1, 2)  
+            k = k.view(B, -1, h, d).transpose(1, 2) 
+            v = v.view(B, -1, h, d).transpose(1, 2) 
+
+            attn = (q @ k.transpose(-2, -1)) * scale     
+            attn = attn.softmax(dim=-1)
+            out  = (attn @ v)                              
+            out  = out.transpose(1, 2).contiguous().view(B, S, E)
+        else:
+            S, B, E = q.shape
+            q = q.view(S, B, h, d).permute(1, 2, 0, 3)     
+            k = k.view(-1, B, h, d).permute(1, 2, 0, 3)   
+            v = v.view(-1, B, h, d).permute(1, 2, 0, 3)   
+
+            attn = (q @ k.transpose(-2, -1)) * scale       
+            attn = attn.softmax(dim=-1)
+            out  = (attn @ v)                              
+            out  = out.permute(2, 0, 1, 3).contiguous().view(S, B, E)
+        # print(out.shape)
+
+        return self.out_proj(out), attn
+
+
+@torch.no_grad()
+def replace_attention_with_custom(model, lora_cfg=None):
+    replace_layers(model, True)
+    
+@torch.no_grad()
+def get_peft_lora_weights(model: nn.Module) -> dict:
+    module_weight_dict = {}
+    for i, resblock in enumerate(model.transformer.resblocks):
+        lora_weights = []
+        for proj_name in ["q_proj", "v_proj"]: 
+            try:
+                proj_layer = getattr(resblock.attn, proj_name)
+                lora_A = proj_layer.lora_A['default'].weight.detach().cpu().reshape(-1)
+                lora_B = proj_layer.lora_B['default'].weight.detach().cpu().reshape(-1)
+                lora_weights.extend([lora_A, lora_B])
+            except AttributeError:
+                print(f"Warning: Could not find LoRA weights for resblock {i}, projection {proj_name}")
+                continue
+        if lora_weights:
+            module_weight_dict[i] = torch.cat(lora_weights)
+    return module_weight_dict
+
+@torch.no_grad()
+def set_peft_lora_weights(weight_dict: dict):
+    weight_dict = deepcopy(weight_dict)
+    for i, resblock in enumerate(vit.transformer.resblocks):
+        if i in weight_dict:
+            current_pos = 0
+            for proj_name in ["q_proj", "v_proj"]: 
+                try:
+                    proj_layer = getattr(resblock.attn, proj_name)
+                    lora_A_layer = proj_layer.lora_A['default']
+                    lora_B_layer = proj_layer.lora_B['default']
+                    device = lora_A_layer.weight.device
+                    
+                    len_A = lora_A_layer.weight.numel()
+                    lora_A_layer.weight.data = weight_dict[i][current_pos:current_pos+len_A].reshape(lora_A_layer.weight.shape).to(device)
+                    current_pos += len_A
+                    
+                    len_B = lora_B_layer.weight.numel()
+                    lora_B_layer.weight.data = weight_dict[i][current_pos:current_pos+len_B].reshape(lora_B_layer.weight.shape).to(device)
+                    current_pos += len_B
+                except Exception as e:
+                    print(e)
+                    print(f"Warning: Could not find LoRA layers in resblock {i}, projection {proj_name} to load weights.")
+                    continue
+
+
+@torch.no_grad()
+def get_peft_lora_weights_hf_vit(model: nn.Module) -> dict:
+    out = {}
+
+    num_layers = model.config.num_hidden_layers
+    for i in range(num_layers):
+        attn = model.vit.encoder.layer[i].attention.attention
+        for name in ["query", "value"]:
+            lin = getattr(attn, name)
+
+            if not hasattr(lin, "lora_A") or "default" not in lin.lora_A:
+                continue
+            A = lin.lora_A["default"].weight.detach().cpu().reshape(-1)
+            B = lin.lora_B["default"].weight.detach().cpu().reshape(-1)
+            out.setdefault(i, [])
+            out[i].extend([A, B])
+        if i in out:
+            out[i] = torch.cat(out[i])
+    return out
+
+@torch.no_grad()
+def set_peft_lora_weights_hf_vit(weight_dict: dict):
+    weight_dict = deepcopy(weight_dict)
+    num_layers = vit.config.num_hidden_layers
+    for i in range(num_layers):
+        if i not in weight_dict:
+            continue
+        cur = weight_dict[i]
+        pos = 0
+        attn = vit.vit.encoder.layer[i].attention.attention
+        for name in ["query", "value"]:
+            lin = getattr(attn, name)
+            if not hasattr(lin, "lora_A") or "default" not in lin.lora_A:
+                continue
+            A_mod = lin.lora_A["default"]
+            B_mod = lin.lora_B["default"]
+            nA = A_mod.weight.numel()
+            nB = B_mod.weight.numel()
+            A_mod.weight.data.copy_(cur[pos:pos+nA].view_as(A_mod.weight)); pos += nA
+            B_mod.weight.data.copy_(cur[pos:pos+nB].view_as(B_mod.weight)); pos += nB
+
+
+laion_vit, preprocess_train, preprocess_val = open_clip.create_model_and_transforms("hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K")
+vit = laion_vit.visual.cuda()
+
+# vit = ViT_Pretrained.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=args.num_classes).cuda()
+# model_string = 'google/vit-base-patch16-224-in21k'
+# preprocess_train = ViTFeatureExtractor.from_pretrained(model_string)
+# preprocess_val = preprocess_train
+# print(vit)
+# print(model)
+# _ = vit(torch.randn(1, 3, 224, 224).cuda())
+# print(_.shape)
+# print(vit.transformer.resblocks[0].attn.in_proj_weight)
+# print(vit)
+# exit(0)
+
+
+# replace_attention_with_custom(vit)
+
+print(vit)
+
+# lora_cfg = LoraConfig(
+# r=32,
+# lora_alpha=32,
+# target_modules=["q_proj", "v_proj"], 
+# lora_dropout=0.0,
+# bias="none",
+# # task_type="FEATURE_EXTRACTION"
+# )
+
+# lora_cfg_vitin = LoraConfig(
+# r=32,
+# lora_alpha=32,
+# target_modules=["query", "value"], 
+# lora_dropout=0.0,
+# bias="none",
+# # task_type="FEATURE_EXTRACTION"
+# )
+# vit = get_peft_model(vit, lora_cfg)
+
+# set_peft_lora_weights(weight_dict)
+
+# t_stat, p_val = eval_with_ttest()
+
+eval_accs = eval()
+print("Final eval accs: ", eval_accs)
