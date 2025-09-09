@@ -35,7 +35,7 @@ from inject import inject_linear_attention
 from transformers.models.vit.modeling_vit import ViTEmbeddings, ViTLayer, ViTIntermediate, ViTOutput, ViTSelfAttention, ViTSelfOutput
 
 
-
+scratch_path = os.environ['SCRATCH']
 import open_clip
 # from 
 
@@ -626,7 +626,7 @@ elif dataset_name == "DomainNet-cil":
     is_hf_dataset = False
 elif dataset_name == "DomainNet-dil":
     args.num_tasks = 6
-    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/DomainNet-dil'
+    args.data_path = os.path.join(os.environ['WORK'], 'data/DomainNet-dil')
     args.task_type = 'dil'
     args.shuffle = False
     args.versatile_inc = False
@@ -946,11 +946,6 @@ for col in range(adapters_per_domain):
 
     train_domain_adaters = {}
     domain_models = {}
-    # train_domain_adaters_list.append(train_domain_adaters)
-
-    # generate a dictionary mapping 0-6 -> 0-6 in a random permutation
-    perm = torch.randperm(num_classes)
-    perm_dict = {i: perm[i].item() for i in range(num_classes)}
     
     # if col > 0:
     #     keys_to_commit = get_keys_lora(model)

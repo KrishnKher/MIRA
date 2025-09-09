@@ -248,36 +248,46 @@ class DualGPM:
         # Register every MultiheadAttention by its key‐dim D:
         #need to change to peft.lora.Linear
     
+        count = 0
         for m in backbone.modules():
-            if args.base_model == 'laion':
-                if isinstance(m, MultiheadAttention):
-                    D = m.hopfield_keys.size(-1)   # dim of each key‐vector
-                    self.memories[m] = {
-                        'basis': torch.empty(D, 0),
-                        'is_Ml': True
-                    }
-                    #Replace hopfield_query_generator with??
-                    if not isinstance(m.hopfield_query_generator, nn.Identity):
-                        for l in m.hopfield_query_generator.modules():
-                            if isinstance(l, nn.Linear):
-                                D = l.weight.size(1)
-                                self.memories[l] = {
-                                    'basis': torch.empty(D, 0),
-                                    'is_Ml': True
-                                }
-            elif args.base_model == 'vit-in21k':
-                if isinstance(m, peft.tuners.lora.layer.Linear):
-                    # print("Registering ViTSelfAttention for DualGPM")
-                    D = m.hopfield_keys.size(-1)   # dim of each key‐vector
-                    self.memories[m] = {
-                        'basis': torch.empty(D, 0),
-                        'is_Ml': True
-                    }
+            # if args.base_model == 'laion':
+            #     if isinstance(m, CustomAttention):
+            #         D = m.hopfield_keys.size(-1)   # dim of each key‐vector
+            #         self.memories[m] = {
+            #             'basis': torch.empty(D, 0),
+            #             'is_Ml': True
+            #         }
+            #         #Replace hopfield_query_generator with??
+            #         if hasattr(m, 'hopfield_query_generator') and not isinstance(m.hopfield_query_generator, nn.Identity):
+            #             for l in m.hopfield_query_generator.modules():
+            #                 if isinstance(l, nn.Linear):
+            #                     D = l.weight.size(1)
+            #                     self.memories[l] = {
+            #                         'basis': torch.empty(D, 0),
+            #                         'is_Ml': True
+            #                     }
+            # elif args.base_model == 'vit-in21k':
+            #     if isinstance(m, peft.tuners.lora.layer.Linear):
+            #         # print("Registering ViTSelfAttention for DualGPM")
+            #         D = m.hopfield_keys.size(-1)   # dim of each key‐vector
+            #         self.memories[m] = {
+            #             'basis': torch.empty(D, 0),
+            #             'is_Ml': True
+            #         }
+            if isinstance(m, peft.tuners.lora.layer.Linear):
+                # print("Registering ViTSelfAttention for DualGPM")
+                D = m.hopfield_keys.size(-1)   # dim of each key‐vector
+                self.memories[m] = {
+                    'basis': torch.empty(D, 0),
+                    'is_Ml': True
+                }
+                count += 1
+            print(f"DualGPM: registered {len(self.memories)},{count} modules so far.")
 
         # Register the classifier (row‐dim = in_features)
-        D = classifier.in_features
+        D = self.classifier.in_features
         print("D", D)
-        self.memories[classifier] = {
+        self.memories[self.classifier] = {
             'basis': torch.empty(D, 0),
             'is_Ml': True
         }
@@ -291,10 +301,11 @@ class DualGPM:
         # 1) Hook each module to grab its input features R ∈ ℝ^{d×N}
         
         inputs = {m: [] for m in self.memories}
-        print("INPUTS", inputs)
+        # print("INPUTS", inputs)
         hooks = []
         for m in inputs:
             def hook_fn(mod, inp, out, m=m):
+                # print(inp.shape)
                 x = inp[0].detach()
                 # For attention: x.shape = [B, S, D] → [D, B·S]
                 if x.ndim == 3:
@@ -311,6 +322,8 @@ class DualGPM:
                 feats = self.backbone(data['image'].cuda())
                 if args.base_model == 'laion':
                     _     = self.classifier(feats)
+                elif args.base_model == 'vit-in21k':
+                    _     = self.classifier(feats.logits)
                 break
 
         # remove hooks
@@ -319,7 +332,11 @@ class DualGPM:
 
         # 3) Expand or reduce each basis
         for m, mem in self.memories.items():
-            R       = torch.cat(inputs[m], dim=1)  # [d×N]
+            try:
+                R       = torch.cat(inputs[m], dim=1)  # [d×N]
+            except Exception as e:
+                print("inputs[m]", m)
+                raise e
             M, flag = mem['basis'], mem['is_Ml']
 
             if flag:
@@ -354,10 +371,9 @@ class DualGPM:
                 else:
                     Gp = (G @ M) @ M.T
                 m.weight.grad.copy_(Gp)
-                continue
 
             # --- MultiheadAttention hopfield_keys: row‐wise on [K×D] --- #
-            if isinstance(m, CustomAttention):
+            elif isinstance(m, CustomAttention) or isinstance(m, peft.tuners.lora.layer.Linear):
                 Gk = m.hopfield_keys.grad  # [K, D]
                 if Gk is None or M.numel()==0:
                     continue
@@ -366,9 +382,8 @@ class DualGPM:
                 else:
                     Gp = (Gk @ M) @ M.T
                 m.hopfield_keys.grad.copy_(Gp)
-                continue
             
-            if isinstance(m, nn.Linear):
+            elif isinstance(m, nn.Linear):
                 # --- Linear: row‐wise on [C×D] --- #
                 G = m.weight.grad
                 if G is None or M.numel()==0:
@@ -377,19 +392,19 @@ class DualGPM:
                     Gp = G - (G @ M) @ M.T
                 else:
                     Gp = (G @ M) @ M.T
-                m.weight.grad.copy_(Gp)
-                continue
+                m.weight.grad.copy_(Gp)                
 
             # --- Fallback: flatten-vector (if you ever register others) --- #
-            w = m.weight if not isinstance(m, nn.ParameterList) else m
-            g = w.grad.reshape(-1,1)
-            if g.numel()==0 or M.numel()==0:
-                continue
-            if flag:
-                gp = g - M @ (M.T @ g)
             else:
-                gp = M @ (M.T @ g)
-            w.grad.copy_(gp.view_as(w))
+                w = m.weight if not isinstance(m, nn.ParameterList) else m
+                g = w.grad.reshape(-1,1)
+                if g.numel()==0 or M.numel()==0:
+                    continue
+                if flag:
+                    gp = g - M @ (M.T @ g)
+                else:
+                    gp = M @ (M.T @ g)
+                w.grad.copy_(gp.view_as(w))
 
     def _expand_Ml(self, M, R):
         # Eq. (5–6) expansion
@@ -570,7 +585,7 @@ elif dataset_name == "CORe50-dil":
     adapter_list = torch.load('/data1/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_CORe50-dil.pt')
 elif dataset_name == "DomainNet-dil":
     args.num_tasks = 6
-    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/DomainNet-dil'
+    args.data_path = os.path.join(os.environ['WORK'], 'data/DomainNet-dil')
     args.task_type = 'dil'
     args.shuffle = True
     args.versatile_inc = False
@@ -616,7 +631,7 @@ elif dataset_name == "DomainNet-dil":
     is_hf_dataset = False
     # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt')
     # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_mira_32rank_1.pt', weights_only=False)
-    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dilstage_1_with_hopfield_3008.pt', weights_only=False)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dilstage_1_with_hopfield_3008.pt', weights_only=False)
     
 # CIL Datasets
 elif args.dataset == "cifar100":
@@ -674,8 +689,8 @@ elif args.dataset == "inetR":
 # hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
 # hopfield_values = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_values_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
 
-hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_laion_DomainNet-dilstage_1_laion_withadapters_witheval.pt')
-hopfield_values = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_values_laion_DomainNet-dilstage_1_laion_withadapters_witheval.pt')
+hopfield_keys = torch.load('weights/hopfield_keys_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
+hopfield_values = torch.load('weights/hopfield_values_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
 # laion, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K')
 # vit = laion.visual.cuda()
 # hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_laion_DomainNet-dilstage_1_with_hopfield_3008.pt')
@@ -719,7 +734,7 @@ os.makedirs(parent_dir, exist_ok=True)
 #     return model_key_net_params
 
 state_dict = torch.load(
-    '/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_laion_DomainNet-dilstage_1_laion_withadapters_witheval.pt',
+    'weights/train_domain_classifiers_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt',
     map_location="cuda",
     weights_only=False
 )
@@ -753,8 +768,8 @@ elif args.base_model == 'vit-in21k':
     )
     model = get_peft_model(model, lora_cfg)
     classifier = nn.Linear(768, args.num_classes, bias=False).cuda()
-    classifier.load_state_dict(last_head.state_dict())
-    model.classifier = classifier
+    # classifier.load_state_dict(last_head.state_dict())
+    model.classifier = model.model.classifier = nn.Identity()
     
 # schd = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-3)
 criterion = nn.CrossEntropyLoss()
@@ -829,7 +844,7 @@ def eval():
                 outputs = classifier(model(pixel_values))
             elif args.base_model == 'vit-in21k':
                 out = model(pixel_values)
-                outputs = out.logits
+                outputs = classifier(out.logits)
             loss = criterion(outputs, labels)
 
             acc = (outputs.argmax(dim=1) == labels).float().mean().item()
@@ -1052,21 +1067,12 @@ for domain_idx, domain in enumerate(train_domains):
     
     print("Number of keys in model: ", len(keys_new))
     
-    trainable_params = []
-    for name, param in model.named_parameters():
-        if "classifier" in name:
-            # param.requires_grad = True
-            trainable_params.append(param)
-    if args.base_model == 'laion':
-        trainable_params = list(classifier.parameters())
+    trainable_params = list(classifier.parameters())
     opt = optim.AdamW(keys_new  + trainable_params, lr=args.lr, weight_decay=1e-2)
     
     if dualGPM is None:
-        if args.base_model == 'laion':
-            dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
-        elif args.base_model == 'vit-in21k':
-            dualGPM = DualGPM(model, model.classifier, eps_th=args.dgm_th)
-    
+        dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
+
     i = 0
     # for name, module in model.named_modules():
     #     if isinstance(module, peft.tuners.lora.layer.Linear):
@@ -1077,8 +1083,6 @@ for domain_idx, domain in enumerate(train_domains):
     # exit()
     # print(keys_new)
             
-    
-
     for epoch in range(epochs):
         
         model.train()
@@ -1103,7 +1107,7 @@ for domain_idx, domain in enumerate(train_domains):
             labels = new_labels
             if args.base_model == 'vit-in21k':
                 out = model(pixel_values)
-                outputs = out.logits
+                outputs = classifier(out.logits)
             elif args.base_model == 'laion':
                 outputs = classifier(model(pixel_values))
             loss = criterion(outputs, labels)
@@ -1131,7 +1135,6 @@ for domain_idx, domain in enumerate(train_domains):
             opt.step()
             acc = (outputs.argmax(dim=1) == labels).float().mean().item()
             pbar.update(step + 1, values=[("loss", loss.item()), ("acc", acc)])
-            # break
         all_accs = eval()
         forgetting = 0
         if args.dataset != 'CORe50-dil':
