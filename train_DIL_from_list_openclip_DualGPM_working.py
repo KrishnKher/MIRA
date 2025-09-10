@@ -248,47 +248,36 @@ class DualGPM:
         # Register every MultiheadAttention by its key‐dim D:
         #need to change to peft.lora.Linear
     
-        count = 0
         for m in backbone.modules():
-            # if args.base_model == 'laion':
-            #     if isinstance(m, CustomAttention):
-            #         D = m.hopfield_keys.size(-1)   # dim of each key‐vector
-            #         self.memories[m] = {
-            #             'basis': torch.empty(D, 0),
-            #             'is_Ml': True
-            #         }
-            #         #Replace hopfield_query_generator with??
-            #         if hasattr(m, 'hopfield_query_generator') and not isinstance(m.hopfield_query_generator, nn.Identity):
-            #             for l in m.hopfield_query_generator.modules():
-            #                 if isinstance(l, nn.Linear):
-            #                     D = l.weight.size(1)
-            #                     self.memories[l] = {
-            #                         'basis': torch.empty(D, 0),
-            #                         'is_Ml': True
-            #                     }
-            # elif args.base_model == 'vit-in21k':
-            #     if isinstance(m, peft.tuners.lora.layer.Linear):
-            #         # print("Registering ViTSelfAttention for DualGPM")
-            #         D = m.hopfield_keys.size(-1)   # dim of each key‐vector
-            #         self.memories[m] = {
-            #             'basis': torch.empty(D, 0),
-            #             'is_Ml': True
-            #         }
             if isinstance(m, peft.tuners.lora.layer.Linear):
                 # print("Registering ViTSelfAttention for DualGPM")
                 D = m.hopfield_keys.size(-1)   # dim of each key‐vector
                 self.memories[m] = {
-                    'basis': torch.empty(D, 0),
+                    'basis': torch.empty(D, 0).cuda(),
                     'is_Ml': True
                 }
-                count += 1
-            print(f"DualGPM: registered {len(self.memories)},{count} modules so far.")
+                if hasattr(m, 'key_generator') and m.key_generator is not None:
+                    for mm in m.key_generator:
+                        if isinstance(mm, nn.Linear):
+                            D = mm.weight.size(-1)
+                            self.memories[mm] = {
+                                'basis': torch.empty(D, 0).cuda(),
+                                'is_Ml': True
+                            }
+                if hasattr(m, 'query_generator') and m.query_generator is not None:
+                    for mm in m.query_generator:
+                        if isinstance(mm, nn.Linear):
+                            D = mm.weight.size(-1)
+                            self.memories[mm] = {
+                                'basis': torch.empty(D, 0).cuda(),
+                                'is_Ml': True
+                            }
 
         # Register the classifier (row‐dim = in_features)
         D = self.classifier.in_features
         print("D", D)
         self.memories[self.classifier] = {
-            'basis': torch.empty(D, 0),
+            'basis': torch.empty(D, 0).cuda(),
             'is_Ml': True
         }
         print(f"DualGPM: registered {len(self.memories)} modules.")
@@ -434,6 +423,8 @@ class DualGPM:
 
     def _reduce_Mperp(self, M, R):
         # Eq. (7–8) reduction
+        M.cuda()
+        R.cuda()
         R_hat_p = M @ (M.T @ R)
         U_p, S_p, _ = torch.linalg.svd(R_hat_p, full_matrices=False)
 
@@ -915,8 +906,29 @@ elif args.base_model == 'vit-in21k':
 # with open("domain")
 # exit()
 
+hopfield_query_params = []
 
-# classifier.load_state_dict(state_dict[len(train_domains) - 1].state_dict())
+for name, module in model.named_modules():
+    # print(name)
+    if isinstance(module, peft.tuners.lora.layer.Linear):
+        # print("Found")
+        module.set_key_generator(nn.Sequential(
+            nn.Linear(768, 256, bias=False),
+            nn.GELU(),
+            nn.Linear(256, 256, bias=False),
+            nn.GELU(),
+            nn.Linear(256, 768, bias=False)
+        ).cuda())
+        hopfield_query_params += list(module.key_generator.parameters())
+        module.set_query_generator(nn.Sequential(
+            nn.Linear(768, 256, bias=False),
+            nn.GELU(),
+            nn.Linear(256, 256, bias=False),
+            nn.GELU(),
+            nn.Linear(256, 768, bias=False)
+        ).cuda())
+        hopfield_query_params += list(module.query_generator.parameters())
+
 for domain_idx, domain in enumerate(train_domains):
     if args.dataset in ['iDigits-dil', 'CORe50-dil', 'DomainNet-dil']:
         dl = dataloaders[domain]
@@ -992,7 +1004,8 @@ for domain_idx, domain in enumerate(train_domains):
         
     keys_new = []
     module_index = 0
-    
+    hopfield_query_params = []
+
     for name, module in model.named_modules():
         # print(name)
         if isinstance(module, peft.tuners.lora.layer.Linear):
@@ -1018,15 +1031,24 @@ for domain_idx, domain in enumerate(train_domains):
             #     if 'prefix' in attr:
             #         print(attr)
             # print(module.prefix.hopfield_keys if hasattr(module.prefix, 'hopfield_keys') else "No prefix", prefix)
+                # if module.hopfield_keys is None:
+                #     module.hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda().clone().detach())
+                #     module.hopfield_values = value_list[module_index]
+                # else:
+                #     module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, torch.ones_like(key_list[module_index]).cuda()], dim=1).cuda().clone().detach())
+                #     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
+                # keys_new.append(module.hopfield_keys)
+                # print(module)
+                hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda())
                 if module.hopfield_keys is None:
-                    module.hopfield_keys = nn.Parameter(key_list[module_index].cuda().clone().detach())
+                    module.hopfield_keys = torch.cat([hopfield_keys], dim=1)
                     module.hopfield_values = value_list[module_index]
                 else:
-                    module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, key_list[module_index].cuda()], dim=1).cuda().clone().detach())
+                    module.hopfield_keys = torch.cat([module.hopfield_keys, hopfield_keys], dim=1)
                     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
-                # print(module)
+                
                 module_index += 1
-                keys_new.append(module.hopfield_keys)
+                keys_new.append(hopfield_keys)
         # exit()
     module_index = 0
     
@@ -1068,7 +1090,7 @@ for domain_idx, domain in enumerate(train_domains):
     print("Number of keys in model: ", len(keys_new))
     
     trainable_params = list(classifier.parameters())
-    opt = optim.AdamW(keys_new  + trainable_params, lr=args.lr, weight_decay=1e-2)
+    opt = optim.AdamW(keys_new  + trainable_params + hopfield_query_params, lr=args.lr, weight_decay=1e-2)
     
     if dualGPM is None:
         dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
