@@ -467,6 +467,7 @@ if args.base_model == 'laion':
     bias="none",
     # task_type="FEATURE_EXTRACTION"
     )
+    
     print(model)
     model = get_peft_model(model, lora_cfg)
 
