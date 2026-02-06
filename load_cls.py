@@ -19,8 +19,6 @@ from torch import Tensor
 import peft
 
 from transformers import AutoImageProcessor
-from transformers import CLIPProcessor, CLIPModel, CLIPVisionModel, CLIPImageProcessor
-
 
 
 
@@ -48,7 +46,7 @@ parser.add_argument("--adapters_per_domain", type=int, default=10)
 parser.add_argument("--epochs", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=128)
 parser.add_argument("--num_classes", type=int, default=65)
-parser.add_argument("--base_model", type=str, default='laion', choices=['laion', 'vit-in21k', 'vit-b32'])
+parser.add_argument("--base_model", type=str, default='laion', choices=['laion', 'vit-in21k'])
 parser.add_argument("--name_tag", type=str, default='')
 parser.add_argument('--seed', type=int, default=None)
 parser.add_argument('--lr', type=float, default=1e-3)
@@ -235,8 +233,6 @@ def get_values_lora(model: nn.Module) -> dict:
                         new_name = name[name.find('resblocks.'):]
                     elif args.base_model == 'vit-in21k':
                         new_name = name[name.find('encoder.layer.'):]
-                    elif args.base_model == 'vit-b32':
-                        new_name = name[name.find('encoder.layers.'):]
                     weight_dict[new_name] = getattr(module, attr).detach().clone()
                     
     return weight_dict
@@ -255,8 +251,6 @@ def get_keys_lora(model: nn.Module) -> dict:
                         new_name = name[name.find('resblocks.'):]
                     elif args.base_model == 'vit-in21k':
                         new_name = name[name.find('encoder.layer.'):]
-                    elif args.base_model == 'vit-b32':
-                        new_name = name[name.find('encoder.layers.'):]
                     weight_dict[new_name] = getattr(module, attr).detach().clone()
                     # print("New name keyword : ", new_name)
     # print(weight_dict)
@@ -383,26 +377,6 @@ def get_peft_lora_weights_hf_vit(model: nn.Module) -> dict:
     return out
 
 @torch.no_grad()
-def get_peft_lora_weights_vit_b32(model: nn.Module) -> dict:
-    out = {}
-
-    num_layers = model.config.num_hidden_layers
-    for i in range(num_layers):
-        attn = model.vision_model.encoder.layers[i].self_attn
-        for name in ["q_proj", "v_proj"]:
-            lin = getattr(attn, name)
-
-            if not hasattr(lin, "lora_A") or "default" not in lin.lora_A:
-                continue
-            A = lin.lora_A["default"].weight.detach().cpu().reshape(-1)
-            B = lin.lora_B["default"].weight.detach().cpu().reshape(-1)
-            out.setdefault(i, [])
-            out[i].extend([A, B])
-        if i in out:
-            out[i] = torch.cat(out[i])
-    return out
-
-@torch.no_grad()
 def set_peft_lora_weights_hf_vit(model: nn.Module, weight_dict: dict):
     weight_dict = deepcopy(weight_dict)
     num_layers = model.config.num_hidden_layers
@@ -504,26 +478,6 @@ elif args.base_model == 'vit-in21k':
 
         vit.load_state_dict(vit_state_dict)
 
-elif args.base_model == 'vit-b32':
-    vit = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").cuda()
-    ip = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    
-    preprocess_train = Compose([
-        RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0),
-                          ratio=(0.75, 1.3333),
-                          interpolation=InterpolationMode.BICUBIC, antialias=True),
-        ToTensor(),
-        Normalize(mean=ip.image_mean, std=ip.image_std),
-    ])
-    preprocess_val = Compose([
-        Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-        CenterCrop((224, 224)),
-        ToTensor(),
-        Normalize(mean=ip.image_mean, std=ip.image_std),
-    ])
-    
-    print(vit)
-
 
 # Load PACS dataset from Hugging Face
 is_hf_dataset = True
@@ -531,166 +485,18 @@ dataset_name = args.dataset
 if dataset_name == "PACS":
     dataset = load_dataset("flwrlabs/pacs")
     train_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
-    if args.base_model == 'vit-in21k':
-        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-    
-    
-    
 elif dataset_name == "DomainNet":
     dataset = load_dataset("wltjr1007/DomainNet")
     train_domains = [0, 1, 2, 3, 4, 5]
 elif dataset_name == "OfficeHome":
     dataset = load_dataset("flwrlabs/office-home")
     train_domains = ['Art', 'Clipart', 'Product', 'Real World']
-    if args.base_model == 'vit-in21k':
-        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-    
 elif dataset_name == "VLCS":
     train_domains = ['Caltech101', 'LabelMe', 'SUN09', 'VOC2007']
     try:
         dataset = load_dataset("ai22mtech12002/DG_VLCS")
     except:
         dataset = make_VLCS('data/VLCS')
-    if args.base_model == 'vit-in21k':
-        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        
-        preprocess_train = Compose([
-                RandomResizedCrop(
-                    size=(224, 224),
-                    scale=(0.9, 1.0),
-                    ratio=(0.75, 1.3333),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True
-                ),
-                RandomHorizontalFlip(p=0.5),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
-        
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=mean, std=std),
-            ])
 elif dataset_name == "TI":
     try:
         dataset = load_dataset("ai22mtech12002/DG_TI")
@@ -717,63 +523,16 @@ elif dataset_name == "iDigits-cil":
     args.versatile_inc = False
     args.num_workers = 8
     args.pin_mem = True
-    if args.base_model == 'laion':
-        preprocess_train = Compose([
-                RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
-    elif args.base_model == 'vit-in21k':
-        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        eval_resize = 256
-        eval_crop = 224
-        preprocess_train = Compose([
-            RandomResizedCrop(size=(224, 224),
-                            scale=(0.9, 1.0),
-                            ratio=(0.75, 1.3333),
-                            interpolation=InterpolationMode.BICUBIC,
-                            antialias=True),
-            ToTensor(),                          
-            Normalize(mean=img_mean, std=img_std)
-        ])
-        preprocess_val = Compose([
-            Resize(size=(eval_resize, eval_resize),
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True),
-            CenterCrop((eval_crop, eval_crop)),
+    preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
             ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        eval_resize = 256
-        eval_crop = 224
-        preprocess_train = Compose([
-            RandomResizedCrop(size=(224, 224),
-                            scale=(0.9, 1.0),
-                            ratio=(0.75, 1.3333),
-                            interpolation=InterpolationMode.BICUBIC,
-                            antialias=True),
-            ToTensor(),                          
-            Normalize(mean=img_mean, std=img_std)
-        ])
-        preprocess_val = Compose([
-            Resize(size=(eval_resize, eval_resize),
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True),
-            CenterCrop((eval_crop, eval_crop)),
+    preprocess_val = Compose([
+            Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop((224, 224)),
             ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
@@ -797,29 +556,6 @@ elif dataset_name == "iDigits-dil":
             ToTensor(),
             Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    if args.base_model == 'vit-b32':
-            ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-            img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-            eval_resize = 256
-            eval_crop = 224
-            preprocess_train = Compose([
-                RandomResizedCrop(size=(224, 224),
-                                scale=(0.9, 1.0),
-                                ratio=(0.75, 1.3333),
-                                interpolation=InterpolationMode.BICUBIC,
-                                antialias=True),
-                ToTensor(),                          
-                Normalize(mean=img_mean, std=img_std)
-            ])
-            preprocess_val = Compose([
-                Resize(size=(eval_resize, eval_resize),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True),
-                CenterCrop((eval_crop, eval_crop)),
-                ToTensor(),
-                Normalize(mean=img_mean, std=img_std)   
-            ])
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
@@ -827,25 +563,22 @@ elif dataset_name == "CORe50-cil":
     args.num_tasks = 5
     args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/Core50'
     args.task_type = 'cil'
-    args.shuffle = True
+    args.shuffle = False
     args.versatile_inc = False
     args.num_workers = 8
     args.pin_mem = True
-    if args.base_model == 'laion':
-        preprocess_train = Compose([
-                RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
+    preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+    preprocess_val = Compose([
+            Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop((224, 224)),
+            ToTensor(),
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
     dataloaders, _, _ = build_continual_dataloader(args=args)
-    
-    
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
 elif dataset_name == "CORe50-dil":
@@ -867,29 +600,6 @@ elif dataset_name == "CORe50-dil":
             ToTensor(),
             Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    if args.base_model == 'vit-b32':
-            ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-            img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-            eval_resize = 256
-            eval_crop = 224
-            preprocess_train = Compose([
-                RandomResizedCrop(size=(224, 224),
-                                scale=(0.9, 1.0),
-                                ratio=(0.75, 1.3333),
-                                interpolation=InterpolationMode.BICUBIC,
-                                antialias=True),
-                ToTensor(),                          
-                Normalize(mean=img_mean, std=img_std)
-            ])
-            preprocess_val = Compose([
-                Resize(size=(eval_resize, eval_resize),
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True),
-                CenterCrop((eval_crop, eval_crop)),
-                ToTensor(),
-                Normalize(mean=img_mean, std=img_std)   
-            ])
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
@@ -901,66 +611,17 @@ elif dataset_name == "DomainNet-cil":
     args.versatile_inc = False
     args.num_workers = 8
     args.pin_mem = True
-    print("args num classes : ", args.num_classes)
-    if args.base_model == 'laion':
-        preprocess_train = Compose([
-                RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
-        preprocess_val = Compose([
-                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                CenterCrop((224, 224)),
-                ToTensor(),
-                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
-            ])
-    elif args.base_model == 'vit-in21k':
-        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        eval_resize = 256
-        eval_crop = 224
-        preprocess_train = Compose([
-            RandomResizedCrop(size=(224, 224),
-                            scale=(0.9, 1.0),
-                            ratio=(0.75, 1.3333),
-                            interpolation=InterpolationMode.BICUBIC,
-                            antialias=True),
-            ToTensor(),                          
-            Normalize(mean=img_mean, std=img_std)
-        ])
-        preprocess_val = Compose([
-            Resize(size=(eval_resize, eval_resize),
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True),
-            CenterCrop((eval_crop, eval_crop)),
+    preprocess_train = Compose([
+            RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
             ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        eval_resize = 256
-        eval_crop = 224
-        preprocess_train = Compose([
-            RandomResizedCrop(size=(224, 224),
-                            scale=(0.9, 1.0),
-                            ratio=(0.75, 1.3333),
-                            interpolation=InterpolationMode.BICUBIC,
-                            antialias=True),
-            ToTensor(),                          
-            Normalize(mean=img_mean, std=img_std)
-        ])
-        preprocess_val = Compose([
-            Resize(size=(eval_resize, eval_resize),
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True),
-            CenterCrop((eval_crop, eval_crop)),
+    preprocess_val = Compose([
+            Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+            CenterCrop((224, 224)),
             ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
+            Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-        
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
@@ -995,30 +656,7 @@ elif dataset_name == "DomainNet-dil":
                 antialias=True),
             CenterCrop((eval_crop, eval_crop)),
             ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
-        ])
-    elif args.base_model == 'vit-b32':
-        ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-        img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-        eval_resize = 256
-        eval_crop = 224
-        preprocess_train = Compose([
-            RandomResizedCrop(size=(224, 224),
-                            scale=(0.9, 1.0),
-                            ratio=(0.75, 1.3333),
-                            interpolation=InterpolationMode.BICUBIC,
-                            antialias=True),
-            ToTensor(),                          
             Normalize(mean=img_mean, std=img_std)
-        ])
-        preprocess_val = Compose([
-            Resize(size=(eval_resize, eval_resize),
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True),
-            CenterCrop((eval_crop, eval_crop)),
-            ToTensor(),
-            Normalize(mean=img_mean, std=img_std)   
         ])
     else:
         preprocess_train = Compose([
@@ -1135,11 +773,10 @@ parent_dir = f'data/{dataset_name}'
 os.makedirs(parent_dir, exist_ok=True)
 
 class DomainDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, preprocess, returns_domain=True, label_offset=None):
+    def __init__(self, dataset, preprocess, returns_domain=True):
         self.dataset = dataset
         self.preprocess = preprocess
         self.returns_domain = returns_domain
-        self.label_offset = label_offset
         # if not is_hf_dataset:
         #     if args.base_model == 'vit-in21k':
         #         self.vit_preprocess = Compose([
@@ -1165,7 +802,7 @@ class DomainDataset(torch.utils.data.Dataset):
         # item['image'].verify()
         if is_hf_dataset:
             if args.base_model == 'vit-in21k':
-                item['image'] = self.preprocess(item['image'])
+                item['image'] = self.vit_preprocess(item['image'])
             else:
                 item['image'] = self.preprocess(item['image'])
             return {'image': item['image'], 'label': item['label']}
@@ -1177,19 +814,13 @@ class DomainDataset(torch.utils.data.Dataset):
             item = {}
             item['image'] = self.preprocess(image)
             item['label'] = label - args.label_offset
-            # item['label'] = (label - self.label_offset) if self.label_offset is not None else label
-            
             return item
 
-# print(train_loaders)
-if args.dataset in ['iDigits-cil', 'iDigits-dil', 'CORe50-cil', 'DomainNet-cil', 'DomainNet-dil', 'CORe50-dil']:
+
+if args.dataset in ['iDigits-cil', 'iDigits-dil', 'CORe50-cil', 'DomainNet-cil', 'DomainNet-dil']:
     for i, dl in enumerate(dataloaders):
         dataset = dl['train']
-        print(len(dataset))
         train_dataset = DomainDataset(dataset, preprocess_train, returns_domain=False)
-        print(len(train_dataset))
-        # print(train_dataset)
-        print(f"Creating train loader for domain {i}")
         train_loaders[i] = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
         print(f"Training samples for domain {i}: {len(dataset)}")
 elif is_hf_dataset:
@@ -1247,65 +878,180 @@ for domain_idx, domain in enumerate(train_domains):
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
         test_domain_loaders.append(test_loader)
     else:
-        # train_dataset = list(benchmark.train_stream)[domain_idx].dataset
-        train_dataset = dl['train']
+        train_dataset = list(benchmark.train_stream)[domain_idx].dataset
         print(f"Training samples for domain {domain}: {len(train_dataset)}")
-        # if args.dataset == 'iDigits-cil':
-            # train_dataset = DomainDataset(train_dataset, preprocess_train, returns_domain=False, label_offset=args.num_classes * domain_idx)
-        # else:
         train_dataset = DomainDataset(train_dataset, preprocess_train)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
 
-        # test_dataset = list(benchmark.test_stream)[domain_idx].dataset
-        test_dataset = dl['test']
+        test_dataset = list(benchmark.test_stream)[domain_idx].dataset
         print(f"Testing samples for domain {domain}: {len(test_dataset)}")
-        # if args.dataset == 'iDigits-cil':
-            # test_dataset = DomainDataset(test_dataset, preprocess_val, returns_domain=False, label_offset=args.num_classes * domain_idx)
-        # else:
         test_dataset = DomainDataset(test_dataset, preprocess_val)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
         test_domain_loaders.append(test_loader)
 
 
-@torch.no_grad()
-def eval(domain_idx):
-    model.eval()
-    domain_accs = {}
-    # pbar = Progbar(len(train_loader))
 
-    test_loader = test_domain_loaders[domain_idx]
-    pbar = Progbar(len(test_loader))
-    for step, batch in enumerate(test_loader):
-        pixel_values = batch['image'].cuda()
-        labels = batch['label'].cuda()
-        if args.base_model == 'laion':
-            outputs = classifier(model(pixel_values))
-        elif args.base_model == 'vit-in21k':
-            out = model(pixel_values)
-            outputs = classifier(out.logits)
-        elif args.base_model == 'vit-b32':
-            out = model(pixel_values)
-            feats = out.pooler_output
-            outputs = classifier(feats)
-        # outputs = classifier(test_model(pixel_values))
-        loss_eval = criterion(outputs, labels)
+hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_vit-in21k_DomainNet-dilcls_tokens.pt')
+hopfield_values = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_values_vit-in21k_DomainNet-dilcls_tokens.pt')
+model = deepcopy(vit)
 
-        acc_eval = (outputs.argmax(dim=1) == labels).float().mean().item()
-        pbar.update(step + 1, values=[("loss", loss_eval.item()), (f"acc {domain_idx}", acc_eval)])
-        
-    domain_accs[domain_idx] = pbar.get_values()[f'acc {domain_idx}']
-    if args.dataset == 'CORe50-dil':
-        return domain_accs
-    return domain_accs
-
-
-
-
-
+if args.base_model == 'laion':
+    replace_attention_with_custom(model)
+    lora_cfg = LoraConfig(
+    r=32,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"], 
+    lora_dropout=0.0,
+    bias="none",
+    # task_type="FEATURE_EXTRACTION"
+    )
+    model = get_peft_model(model, lora_cfg)
+    
+    classifier = nn.Linear(512, args.num_classes, bias=False).cuda()
+    # classifier.load_state_dict(last_head.state_dict())
+    print(classifier)
+elif args.base_model == 'vit-in21k':
+    lora_cfg = LoraConfig(
+        r=32,
+        lora_alpha=32,
+        target_modules=["query", "value"],
+        modules_to_save=["classifier"],
+        lora_dropout=0.0,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_cfg)
+    classifier = nn.Linear(768, args.num_classes, bias=False).cuda()
+    # classifier.load_state_dict(last_head.state_dict())
+    model.classifier = model.model.classifier = nn.Identity()
 
 
+domain_adapters = {}
 
+# print(hopfield_keys.shape, hopfield_values.shape)
+if args.base_model == 'laion':
+    for domain_idx, domain in enumerate(train_domains):
+        domain_adapters[domain_idx] = {
+            "keys_q" : [
+                hopfield_keys[f'resblocks.{i}.attn.q_proj'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_q" : [
+                hopfield_values[f'resblocks.{i}.attn.q_proj'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ],
+            "keys_v" : [
+                hopfield_keys[f'resblocks.{i}.attn.v_proj'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_v" : [
+                hopfield_values[f'resblocks.{i}.attn.v_proj'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ]
+        }
+elif args.base_model == 'vit-in21k':
+    for domain_idx, domain in enumerate(train_domains):
+        domain_adapters[domain_idx] = {
+            "keys_q" : [
+                hopfield_keys[f'encoder.layer.{i}.attention.attention.query'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_q" : [
+                hopfield_values[f'encoder.layer.{i}.attention.attention.query'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ],
+            "keys_v" : [
+                hopfield_keys[f'encoder.layer.{i}.attention.attention.value'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_v" : [
+                hopfield_values[f'encoder.layer.{i}.attention.attention.value'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ]
+        }
+for domain_idx, domain in enumerate(train_domains):
+    keys_q = domain_adapters[domain_idx]["keys_q"]
+    keys_v = domain_adapters[domain_idx]["keys_v"]
+    
+    values_q = domain_adapters[domain_idx]["values_q"]
+    values_v = domain_adapters[domain_idx]["values_v"]
+    prev_keys = None
+    keys_new = []
+    module_index = 0
+    for name, module in model.named_modules():
+        # print(name)
+        if isinstance(module, peft.tuners.lora.layer.Linear):
+            # print("Found")
+            module.use_hopfield = True
+            
+            if args.base_model == 'laion':
+                prefix = f'resblocks.{module_index}.attn.' + ('q_proj')
+                key_list = keys_q
+                value_list = values_q
+            elif args.base_model == 'vit-in21k':
+                prefix = f'encoder.layer.{module_index}.attention.attention.' + 'query'
+                key_list = keys_q
+                value_list = values_q
+            
 
+            # exit()
+            if name.endswith(prefix):
+                # print(name, module_index, prefix)
+                    
+            # FInding module + prefix attr
+            # for attr in dir(module):
+            #     if 'prefix' in attr:
+            #         print(attr)
+            # print(module.prefix.hopfield_keys if hasattr(module.prefix, 'hopfield_keys') else "No prefix", prefix)
+                # if module.hopfield_keys is None:
+                #     module.hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda().clone().detach())
+                #     module.hopfield_values = value_list[module_index]
+                # else:
+                #     module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, torch.ones_like(key_list[module_index]).cuda()], dim=1).cuda().clone().detach())
+                #     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
+                # keys_new.append(module.hopfield_keys)
+                # print(module)
+                hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda())
+                if module.hopfield_keys is None:
+                    module.hopfield_keys = torch.cat([hopfield_keys], dim=1)
+                    module.hopfield_values = value_list[module_index]
+                else:
+                    module.hopfield_keys = torch.cat([module.hopfield_keys, hopfield_keys], dim=1)
+                    module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
+                
+                module_index += 1
+                keys_new.append(hopfield_keys)
+        # exit()
+    module_index = 0
+    
+    for name, module in model.named_modules():
+        # print(name)
+        if isinstance(module, peft.tuners.lora.layer.Linear):
+            # print("Found")
+            module.use_hopfield = True
+            
+            if args.base_model == 'laion':
+                prefix = f'resblocks.{module_index}.attn.' + ('v_proj')
+                key_list = keys_v
+                value_list = values_v
+            elif args.base_model == 'vit-in21k':
+                prefix = f'encoder.layer.{module_index}.attention.attention.' + 'value'
+                key_list = keys_v
+                value_list = values_v
+            
+
+            # exit()
+            if name.endswith(prefix):
+                if module.hopfield_keys is None:
+                    module.hopfield_keys = nn.Parameter(key_list[module_index].cuda().clone().detach())
+                    module.hopfield_values = value_list[module_index]
+                else:
+                    module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, key_list[module_index].cuda()], dim=1).cuda().clone().detach())
+                    module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
+                # print(module)
+                module_index += 1
+                keys_new.append(module.hopfield_keys)
+    
+    print("Number of keys in model: ", len(keys_new))
 
 
 
@@ -1315,315 +1061,101 @@ classifier = None
 
 
 
+
+
 prev_keys = []
 prev_values = []
-for col in range(adapters_per_domain):
+# for col in range(adapters_per_domain):
     
 
     
-    #After every adapter, load hopfield keys and hopfield values in the model and then train
-    #do it for if col > 0->load_hopfield_keys/values_function
-    #hopfield values should match with adapters saved after flattening
+#     #After every adapter, load hopfield keys and hopfield values in the model and then train
+#     #do it for if col > 0->load_hopfield_keys/values_function
+#     #hopfield values should match with adapters saved after flattening
     
 
 
-    train_domain_adaters = {}
-    domain_models = {}
+#     train_domain_adaters = {}
+#     domain_models = {}
     
-    # if col > 0:
-    #     keys_to_commit = get_keys_lora(model)
-    #     values_to_commit = get_values_lora(model)
+#     # if col > 0:
+#     #     keys_to_commit = get_keys_lora(model)
+#     #     values_to_commit = get_values_lora(model)
 
-    if args.dataset in ['iDigits-cil', 'CORe50-cil', 'DomainNet-cil']:
-        args.label_offset = 0
+#     if args.dataset in ['iDigits-cil', 'CORe50-cil', 'DomainNet-cil']:
+#         args.label_offset = 0
 
-    for did, domain_name in enumerate(train_domains):
-        print(f"Domain {domain_name} ({did})")
-        if args.base_model == 'laion':
+#     for did, domain_name in enumerate(train_domains):
+#         print(f"Domain {domain_name} ({did})")
+#         if args.base_model == 'laion':
             
-            model = deepcopy(vit)
-            lora_cfg = LoraConfig(
-            r=32,
-            lora_alpha=32,
-            target_modules=["q_proj", "v_proj"], 
-            lora_dropout=0.0,
-            bias="none",
-            # task_type="FEATURE_EXTRACTION"
-            )
-            model = get_peft_model(model, lora_cfg)
-            classifier = nn.Linear(512, num_classes, bias=False).cuda()
-            
-            
-
-            print("\n" + "="*50)
-            print("🔎 MODEL STRUCTURE")
-            print("="*50)
-            # print(model) 
-
-            print("\n" + "="*50)
-            print("TRAINABLE PARAMETERS")
-            print("="*50)
-            # for name, param in model.named_parameters():
-            #     if param.requires_grad:
-            #         print(name)
-
-            print("="*50 + "\n")
-            print(f"--- Training Domain: {domain_name} ---")
-            # model.print_trainable_parameters()
+#             model = deepcopy(vit)
+#             lora_cfg = LoraConfig(
+#             r=32,
+#             lora_alpha=32,
+#             target_modules=["q_proj", "v_proj"], 
+#             lora_dropout=0.0,
+#             bias="none",
+#             # task_type="FEATURE_EXTRACTION"
+#             )
+#             model = get_peft_model(model, lora_cfg)
+#             classifier = nn.Linear(512, num_classes, bias=False).cuda()
             
             
-            trainable_params = [classifier.weight]
-            # for name, param in model.named_parameters():
-            #     # num_total += param.numel()
-            #     if "lora" in name or "classifier" in name:
-            #         param.requires_grad = True
-            #         # num_trainable += param.numel()
-            #         trainable_params.append(param)
-            #     if "classifier" in name:
-            #         print(name + ":", "Training classifier" if param.requires_grad else "Freezing classifier")
-            trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
-            # trainable_params = []
-            trainable_params.extend(list(classifier.parameters()))
 
+#             print("\n" + "="*50)
+#             print("🔎 MODEL STRUCTURE")
+#             print("="*50)
+#             # print(model) 
 
-            # print("Printing model structure :", model)
-        elif args.base_model == 'vit-in21k':
-            model = deepcopy(vit)
-            lora_cfg = LoraConfig(
-            r=32,
-            lora_alpha=32,
-            target_modules=["query", "value"],
-            modules_to_save=["classifier"],
-            lora_dropout=0.0,
-            bias="none",
-            # task_type="FEATURE_EXTRACTION"
-        )
-            model = get_peft_model(model, lora_cfg)
-            # model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k').cuda()
-            # classifier = model.classifier
-            classifier = nn.Linear(768, num_classes, bias=False).cuda()
-            # model.classifier = classifier
-            model.classifier = model.model.classifier = nn.Identity()
-            # load_vit_weights(model, vit)
-        
-        elif args.base_model == 'vit-b32':
-            model = deepcopy(vit)
-            lora_cfg = LoraConfig(
-            r=32,
-            lora_alpha=32,
-            target_modules=["q_proj", "v_proj"],
-            modules_to_save=["classifier"],
-            lora_dropout=0.0,
-            bias="none",
-            )
-            model = get_peft_model(model, lora_cfg)
-            classifier = nn.Linear(768, num_classes, bias=False).cuda()
+#             print("\n" + "="*50)
+#             print("TRAINABLE PARAMETERS")
+#             print("="*50)
+#             # for name, param in model.named_parameters():
+#             #     if param.requires_grad:
+#             #         print(name)
+
+#             print("="*50 + "\n")
+#             print(f"--- Training Domain: {domain_name} ---")
+#             # model.print_trainable_parameters()
             
-            print("Model", model)
+            
+#             trainable_params = [classifier.weight]
+#             # for name, param in model.named_parameters():
+#             #     # num_total += param.numel()
+#             #     if "lora" in name or "classifier" in name:
+#             #         param.requires_grad = True
+#             #         # num_trainable += param.numel()
+#             #         trainable_params.append(param)
+#             #     if "classifier" in name:
+#             #         print(name + ":", "Training classifier" if param.requires_grad else "Freezing classifier")
+#             trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+#             # trainable_params = []
+#             trainable_params.extend(list(classifier.parameters()))
+
+
+#             # print("Printing model structure :", model)
+#         elif args.base_model == 'vit-in21k':
+#             model = deepcopy(vit)
+#             lora_cfg = LoraConfig(
+#             r=32,
+#             lora_alpha=32,
+#             target_modules=["query", "value"],
+#             modules_to_save=["classifier"],
+#             lora_dropout=0.0,
+#             bias="none",
+#             # task_type="FEATURE_EXTRACTION"
+#         )
+#             model = get_peft_model(model, lora_cfg)
+#             # model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k').cuda()
+#             # classifier = model.classifier
+#             classifier = nn.Linear(768, num_classes, bias=False).cuda()
+#             model.classifier = classifier
+#             # load_vit_weights(model, vit)
             
         
-        train_loader = train_loaders[domain_name]
+#         train_loader = train_loaders[domain_name]
 
-        num_trainable = 0
-        num_total = 0
-        # trainable_params = [classifier.weight]
-        trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
-        # trainable_params.append(classifier.weight)
-        # if args.base_model == 'laion':
-        trainable_params.extend(list(classifier.parameters()))
-
-
-        # for name, param in model.named_parameters():
-        #     if param.requires_grad:
-        #         print(name)
-            
-        # print("Trainable parameters: ", trainable_params)
-        for name, param in model.named_parameters():
-            num_total += param.numel()
-            if "classifier" in name:
-                param.requires_grad = True
-                num_trainable += param.numel()
-                trainable_params.append(param)
-            # if "classifier" in name:
-            #     print(name + ":", "Training classifier" if param.requires_grad else "Freezing classifier")        
-
-        # print(f"Trainable parameters: {num_trainable} / {num_total}")
-
-        if len(prev_keys) > 0 and len(prev_values) > 0:
-            print(len(prev_keys), len(prev_values))
-            i1 = 0
-            i2 = 0
-            with torch.no_grad():
-                for name, module in model.named_modules():
-
-                    if isinstance(module, peft.tuners.lora.layer.Linear):
-                        for attr in dir(module):
-                            if attr.endswith('hopfield_keys'):
-                                # print(f"Loading hopfield keys for {name} using {i1}th key")
-                                # keys_param = getattr(module, attr)
-                                setattr(module, attr, nn.Parameter(prev_keys[i1]))
-                                
-                                
-                                # keys_param = nn.Parameter(prev_keys[i1])
-                                # keys_param.copy_(prev_keys[i1].to(keys_param.device, dtype=keys_param.dtype))
-                                # print(f"After loading hopfield keys for {name}, keys_param shape: {getattr(module, attr).shape}")
-                                i1 += 1
-                                # print(f"Previous keys shape: {prev_keys[i].shape}, Current keys shape: {keys_param.shape}")
-                            if attr.endswith('hopfield_values'):
-                                # values_param = getattr(module, attr)
-                                setattr(module, attr, prev_values[i2])
-                                # print(f"Previous values shape: {prev_values[i].shape}, Current values shape: {values_param.shape}")
-                                # if values_param.shape == prev_values[i].shape:
-                                # values_param = prev_values[i2]
-                                # values_param.copy_(prev_values[i2].to(values_param.device, dtype=values_param.dtype))
-                                # print(f"After loading hopfield values for {name}, values_param shape: {getattr(module, attr).shape}")
-
-                                i2 += 1
-
-        prev_keys = []
-        prev_values = []
-         
-        # Train the model
-        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-12)
-        criterion = nn.CrossEntropyLoss()
-
-        model.train()
-        # model_v = torch.vmap(model)
-        # classifier_v = torch.vmap(classifier)
-
-        for epoch in range(epochs):
-            pbar = Progbar(len(train_loader))
-            acc_list = []
-            for step, batch in enumerate(train_loader):
-                optimizer.zero_grad()
-                pixel_values = batch['image'].cuda()
-                labels = batch['label'].cuda()
-                if step == 0:
-                    print("Labels: ", labels.min(), labels.max())
-                if args.base_model == 'laion':
-                    # pixel_values = pixel_values[:,None,...]
-                    outputs = classifier(model(pixel_values))
-                    outputs = outputs.squeeze(1)
-                elif args.base_model == 'vit-in21k':
-                    out = model(pixel_values)
-                    # print("Model Output", out)
-                    outputs = classifier(out.logits)
-                    outputs = outputs.squeeze(1)
-                elif args.base_model == 'vit-b32':
-                    out = model(pixel_values)
-                    feats = out.pooler_output
-                    outputs = classifier(feats)
-                    outputs = outputs.squeeze(1)
-                    # print("Outputs: ", outputs)
-                # print("OUTPUTS: ", outputs.shape)
-                # print("OUTPUTS ################################################################")
-                # print(model(pixel_values)[:, 128:256])
-                # print("Shape of outputs : ", outputs.shape)
-                # print("Min of labels: ", labels.min().item(), " Max of labels: ", labels.max().item())
-                # print("Shape of labels: ", labels.shape)
-                # print("Min of outputs: ", outputs.min().item(), " Max of outputs: ", outputs.max().item())
-                loss = criterion(outputs, labels)
-                # old_weights = {name: param.clone().detach() for name, param in model.named_parameters() if param.requires_grad}
-                loss.backward()
-                
-                # #After every step print the difference between the newer and older weights
-                # for name, param in model.named_parameters():
-                #     if param.requires_grad:
-                #         print(f"Weight change in {name}: {param.data - param.data.clone().detach()}")
-
-                # if step == 0 or step == 10: 
-                #     print("\n" + "="*50)
-                #     print("🔎 GRADIENT CHECK (FIRST BATCH)")
-                #     print("="*50)
-                #     total_grad_norm = 0.0
-                #     for name, param in model.named_parameters():
-                #         if param.requires_grad and param.grad is not None:
-                           
-                #             grad_norm = param.grad.abs().sum()
-                #             print(f"{name:<60} | Grad Norm: {grad_norm.item():.4f}")
-                #             total_grad_norm += grad_norm
-                #         elif param.requires_grad:
-                            
-                #             print(f"WARNING: {name:<60} | Grad is None!")
-                    
-                #     print("-" * 50)
-                #     print(f"Total Gradient Norm on All Trainable Params: {total_grad_norm.item():.4f}")
-                #     print("="*50 + "\n")
-                optimizer.step()
-                # break
-                
-                #Printing change
-                # for name, param in model.named_parameters():
-                #     if param.requires_grad:
-                #         delta = param.detach() - old_weights[name]
-                        # print(f"Change in {name}: mean={delta.abs().mean().item():.6f}, max={delta.abs().max().item():.6f}")  
-                
-                
-                acc = (outputs.argmax(dim=1) == labels).float().mean().item()
-                
-                acc_list.append(acc)
-                pbar.update(step + 1, values=[("loss", loss.item()), ("acc", acc)])
-            if sum(acc_list)/len(acc_list) > 0.99:
-                break
-        
-            # all_accs = eval(domain_name)
-            print()
-
-        # train_domain_adaters[domain_name] = get_peft_lora_weights(model)
-        classifiers[did] = deepcopy(classifier)
-        print("Verifying saved weights...")
-        print(len(train_domain_adaters_list))
-        if(len(train_domain_adaters_list) >= did + 1):
-            if args.base_model == 'laion':
-                train_domain_adaters_list[did] = get_peft_lora_weights(model)
-            elif args.base_model == 'vit-in21k':
-                train_domain_adaters_list[did] = get_peft_lora_weights_hf_vit(model)
-            elif args.base_model == 'vit-b32':
-                train_domain_adaters_list[did] = get_peft_lora_weights_vit_b32(model)
-        else:
-            if args.base_model == 'laion':
-                train_domain_adaters_list.append(get_peft_lora_weights(model))
-            elif args.base_model == 'vit-in21k':
-                train_domain_adaters_list.append(get_peft_lora_weights_hf_vit(model))
-            elif args.base_model == 'vit-b32':
-                train_domain_adaters_list.append(get_peft_lora_weights_vit_b32(model))
-        print(len(train_domain_adaters_list))
-        
-        
-        # keys_before = get_keys_lora(model)
-    
-        if col> 0:
-            for name, module in model.named_modules():
-                if isinstance(module, peft.tuners.lora.layer.Linear):
-                    for attr in dir(module):
-                        if attr.endswith('hopfield_keys'):
-                        
-                            keys_param = getattr(module, attr)
-                            print(f"Keys shape before init hopfield {col}: {keys_param.shape}")
-                        if attr.endswith('hopfield_values'):
-                            values_param = getattr(module, attr)
-                            print(f"Values shape before init hopfield {col}: {values_param.shape}")
-
-        hopfield_init(model)
-        
-        for name, module in model.named_modules():
-            if isinstance(module, peft.tuners.lora.layer.Linear):
-                for attr in dir(module):
-                    if attr.endswith('hopfield_keys'):
-                        keys_param = getattr(module, attr)
-                        print(f"Keys shape {col}: {keys_param.shape}")
-                        prev_keys.append(keys_param.clone().detach())
-                    if attr.endswith('hopfield_values'):
-                        values_param = getattr(module, attr)
-                        prev_values.append(values_param.clone().detach())
-        
-        print(f"After loading in list, prev_keys length: {len(prev_keys)}, prev_values length: {len(prev_values)}")
-            
-
-        classifiers[did] = deepcopy(classifier)
-
-        if args.dataset in ['iDigits-cil', 'CORe50-cil', 'DomainNet-cil']:
-            args.label_offset += args.num_classes
 
 
 # weight_dict_keys = {}
@@ -1682,8 +1214,6 @@ def seed_hopfield_keys_with_cls_means(per_layer_cls, domain_idx, adapter_number)
             elif args.base_model == 'vit-in21k':
                 prefix = f'encoder.layer.{module_index}.attention.attention.' + 'query'
 
-            elif args.base_model == 'vit-b32':
-                prefix = f'encoder.layers.{module_index}.self_attn.' + 'q_proj'
         
             if name.endswith(prefix):
                 hk = module.hopfield_keys
@@ -1703,8 +1233,7 @@ def seed_hopfield_keys_with_cls_means(per_layer_cls, domain_idx, adapter_number)
                 prefix = f'resblocks.{module_index}.attn.' + ('v_proj')
             elif args.base_model == 'vit-in21k':
                 prefix = f'encoder.layer.{module_index}.attention.attention.' + 'value'
-            elif args.base_model == 'vit-b32':
-                prefix = f'encoder.layers.{module_index}.self_attn.' + 'v_proj'
+        
             if name.endswith(prefix):
                 hk = module.hopfield_keys
                 print("shape before seeding", hk.shape)
@@ -1741,27 +1270,26 @@ def seed_hopfield_keys_with_cls_means(per_layer_cls, domain_idx, adapter_number)
         #     assigned += hk.numel()
         # else:
         #     print(f"[skip] {name}: hopfield_keys shape {tuple(hk.shape)} incompatible with D={D}")
-    # print(f"Seeded hopfield_keys with {assigned} values from CLS means.") 
+    print(f"Seeded hopfield_keys with {assigned} values from CLS means.") 
 
-if args.base_model == 'vit-in21k' or args.base_model == 'vit-b32':
-    for col in range(adapters_per_domain):
-        for did, domain_name in enumerate(train_domains):
-            # print(f"Computing and saving mean CLS for domain {domain_name}...")
-            # train_loader = train_loaders[domain_name]
-            # cls_embeddings = []
-            # for step, batch in enumerate(train_loader):
-            #     pixel_values = batch['image'].cuda()
-            #     embeddings = model.embeddings(pixel_values)
-                
-            #     for i, layer in enumerate(model.vit.encoder.layer):
-            #         embeddings = layer(embeddings)
-            #         if step == 0:
-            #             cls_embeddings.append(embeddings[:, 0, :].unsqueeze(1).cuda())
-            #         else:
-            #             cls_embeddings[i] = torch.cat([cls_embeddings[i], embeddings[:, 0, :].unsqueeze(1).cuda()], dim=1)
+for col in range(adapters_per_domain):
+    for did, domain_name in enumerate(train_domains):
+        print(f"Computing and saving mean CLS for domain {domain_name}...")
+        # train_loader = train_loaders[domain_name]
+        # cls_embeddings = []
+        # for step, batch in enumerate(train_loader):
+        #     pixel_values = batch['image'].cuda()
+        #     embeddings = model.embeddings(pixel_values)
+            
+        #     for i, layer in enumerate(model.vit.encoder.layer):
+        #         embeddings = layer(embeddings)
+        #         if step == 0:
+        #             cls_embeddings.append(embeddings[:, 0, :].unsqueeze(1).cuda())
+        #         else:
+        #             cls_embeddings[i] = torch.cat([cls_embeddings[i], embeddings[:, 0, :].unsqueeze(1).cuda()], dim=1)
 
-            mean_cls = average_cls_per_layer(train_loaders[domain_name], device="cuda", l2norm=True)
-            seed_hopfield_keys_with_cls_means(mean_cls, did, col)
+        mean_cls = average_cls_per_layer(train_loaders[domain_name], device="cuda", l2norm=False)
+        seed_hopfield_keys_with_cls_means(mean_cls, did, col)
                 
 
         

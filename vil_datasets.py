@@ -43,6 +43,8 @@ def build_continual_dataloader(args):
                     transform_val=transform_val,
                     args=args,
                 )
+                
+                # print("Train: ", dataset_train)
 
                 # print(dir(dataset_train.data))
                 # exit()
@@ -71,8 +73,13 @@ def build_continual_dataloader(args):
                 transform_val=transform_val,
                 args=args,
             )
+            
+            # print("Len train:", len(dataset_train))
+            # print("Train: ", dataset_train)
+            
 
             splited_dataset, class_mask = split_single_dataset(dataset_train, dataset_val, args)
+            # print("Len splited_dataset:", len(splited_dataset))
             args.nb_classes = len(dataset_val.classes)
 
     elif mode in ['dil', 'vil']:
@@ -99,7 +106,7 @@ def build_continual_dataloader(args):
                 args=args,
             )
 
-            if args.dataset in ['CORe50']:
+            if args.dataset in ['CORe50', 'CORe50-dil']:
                 splited_dataset = [(dataset_train[i], dataset_val) for i in range(len(dataset_train))]
                 args.nb_classes = len(dataset_val.classes)
             else:
@@ -208,6 +215,9 @@ def get_dataset(dataset, transform_train, transform_val, args):
 
 def split_single_dataset(dataset_train, dataset_val, args):
     nb_classes = len(dataset_val.classes)
+
+    print("Number of classes:", nb_classes)
+    print("Number of tasks:", args.num_tasks)
     assert nb_classes % args.num_tasks == 0
     classes_per_task = nb_classes // args.num_tasks
 

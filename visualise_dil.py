@@ -1102,49 +1102,6 @@ block_wise_softmax = {f'{i}': [] for i in range(12)}
 domain_wise_softmax = []
 
 for domain_idx, domain in enumerate(train_domains):
-    if args.dataset in ['iDigits-dil', 'CORe50-dil', 'DomainNet-dil']:
-        dl = dataloaders[domain]
-        train_dataset = dl['train']
-        train_dataset = DomainDataset(train_dataset, preprocess_train, returns_domain=False)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-        test_dataset = dl['test']
-        test_dataset = DomainDataset(test_dataset, preprocess_val, returns_domain=False)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
-        test_domain_loaders.append(test_loader)
-        print(f"Training samples for domain {domain}: {len(train_dataset)}")
-        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
-    elif is_hf_dataset:
-        train_dataset = dataset.filter(lambda x: x['domain'] == domain)
-        try:
-            train_dataset = train_dataset['train']
-        except KeyError:
-            pass  
-        
-        train_dataset = DomainDataset(train_dataset, preprocess_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-
-        test_dataset = dataset.filter(lambda x: x['domain'] == domain)
-        try:
-            test_dataset = test_dataset['test']
-        except KeyError:
-            try:
-                test_dataset = test_dataset['train']
-            except:
-                pass
-        test_dataset = DomainDataset(test_dataset, preprocess_val)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
-        test_domain_loaders.append(test_loader)
-    else:
-        train_dataset = list(benchmark.train_stream)[domain_idx].dataset
-        print(f"Training samples for domain {domain}: {len(train_dataset)}")
-        train_dataset = DomainDataset(train_dataset, preprocess_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-
-        test_dataset = list(benchmark.test_stream)[domain_idx].dataset
-        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
-        test_dataset = DomainDataset(test_dataset, preprocess_val)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
-        test_domain_loaders.append(test_loader)
     
     keys_q = domain_adapters[domain_idx]["keys_q"]
     keys_v = domain_adapters[domain_idx]["keys_v"]
@@ -1254,6 +1211,7 @@ for domain_idx, domain in enumerate(train_domains):
 
             # exit()
             if name.endswith(prefix):
+                print(name)
                 # print(name, module_index, prefix)
                     
             # FInding module + prefix attr
@@ -1280,23 +1238,68 @@ for domain_idx, domain in enumerate(train_domains):
                 
     
     print("Number of keys in model: ", len(keys_new))
-    
-    trainable_params = list(classifier.parameters())
-    opt = optim.AdamW(keys_new  + trainable_params + hopfield_query_params, lr=args.lr, weight_decay=1e-2)
-    
-    if dualGPM is None:
-        dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
 
-    i = 0
-    # for name, module in model.named_modules():
-    #     if isinstance(module, peft.tuners.lora.layer.Linear):
-    #         print(i)
-    #         i += 1
-    #         print(name)
-            # print(module.hopfield_keys.shape, module.hopfield_keys.shape)
-    # exit()
-    # print(keys_new)
-            
+# exit(0)  
+trainable_params = list(classifier.parameters())
+opt = optim.AdamW(keys_new  + trainable_params + hopfield_query_params, lr=args.lr, weight_decay=1e-2)
+
+if dualGPM is None:
+    dualGPM = DualGPM(model, classifier, eps_th=args.dgm_th)
+
+i = 0
+# for name, module in model.named_modules():
+#     if isinstance(module, peft.tuners.lora.layer.Linear):
+#         print(i)
+#         i += 1
+#         print(name)
+        # print(module.hopfield_keys.shape, module.hopfield_keys.shape)
+# exit()
+# print(keys_new)
+for domain_idx, domain in enumerate(train_domains):
+    if args.dataset in ['iDigits-dil', 'CORe50-dil', 'DomainNet-dil']:
+        dl = dataloaders[domain]
+        train_dataset = dl['train']
+        train_dataset = DomainDataset(train_dataset, preprocess_train, returns_domain=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+        test_dataset = dl['test']
+        test_dataset = DomainDataset(test_dataset, preprocess_val, returns_domain=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+        print(f"Training samples for domain {domain}: {len(train_dataset)}")
+        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
+    elif is_hf_dataset:
+        train_dataset = dataset.filter(lambda x: x['domain'] == domain)
+        try:
+            train_dataset = train_dataset['train']
+        except KeyError:
+            pass  
+        
+        train_dataset = DomainDataset(train_dataset, preprocess_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+
+        test_dataset = dataset.filter(lambda x: x['domain'] == domain)
+        try:
+            test_dataset = test_dataset['test']
+        except KeyError:
+            try:
+                test_dataset = test_dataset['train']
+            except:
+                pass
+        test_dataset = DomainDataset(test_dataset, preprocess_val)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+    else:
+        train_dataset = list(benchmark.train_stream)[domain_idx].dataset
+        print(f"Training samples for domain {domain}: {len(train_dataset)}")
+        train_dataset = DomainDataset(train_dataset, preprocess_train)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+
+        test_dataset = list(benchmark.test_stream)[domain_idx].dataset
+        print(f"Testing samples for domain {domain}: {len(test_dataset)}")
+        test_dataset = DomainDataset(test_dataset, preprocess_val)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        test_domain_loaders.append(test_loader)
+        
     for epoch in range(epochs):
         
         model.train()
@@ -1323,6 +1326,8 @@ for domain_idx, domain in enumerate(train_domains):
                 out = model(pixel_values)
                 outputs = classifier(out.logits)
             elif args.base_model == 'laion':
+                out = model(pixel_values)
+                break
                 outputs = classifier(model(pixel_values))
             elif args.base_model == 'vit-b32':
                 out = model(pixel_values)
@@ -1365,26 +1370,127 @@ for domain_idx, domain in enumerate(train_domains):
             acc = (outputs.argmax(dim=1) == labels).float().mean().item()
             pbar.update(step + 1, values=[("loss", loss.item()), ("acc", acc)])
             # break
-        all_accs = eval()
-        forgetting = 0
-        if args.dataset != 'CORe50-dil':
-            for i in range(domain_idx):
-                forgetting += first_accs[i] - all_accs[i]
-            first_accs[domain_idx] = all_accs[domain_idx]
-            print("Avg acc: ", np.mean(list(all_accs.values())))
-            print("Avg forgetting: ", forgetting / domain_idx if domain_idx > 0 else 0)
-        elif domain_idx > 0:
-            forgetting = first_accs[0] - all_accs[0]
-            print("Avg acc: ", np.mean(list(all_accs.values())))
-            print("Avg forgetting: ", forgetting if domain_idx > 0 else 0)
-        else:
-            first_accs[domain_idx] = all_accs[domain_idx]
+        # all_accs = eval()
+        # forgetting = 0
+        # if args.dataset != 'CORe50-dil':
+        #     for i in range(domain_idx):
+        #         forgetting += first_accs[i] - all_accs[i]
+        #     first_accs[domain_idx] = all_accs[domain_idx]
+        #     print("Avg acc: ", np.mean(list(all_accs.values())))
+        #     print("Avg forgetting: ", forgetting / domain_idx if domain_idx > 0 else 0)
+        # elif domain_idx > 0:
+        #     forgetting = first_accs[0] - all_accs[0]
+        #     print("Avg acc: ", np.mean(list(all_accs.values())))
+        #     print("Avg forgetting: ", forgetting if domain_idx > 0 else 0)
+        # else:
+        #     first_accs[domain_idx] = all_accs[domain_idx]
         print()
-    
+
 
             
     dualGPM.update(train_loader)
+    # print(block_wise_softmax)
+    # exit(0)
 
+#plotting block_wise_softmax for each domain per block
+# each
+# with open (f'blockwise_scores.json', 'w') as f:
+#     json.dump(block_wise_softmax, f)
+# print(block_wise_softmax['0'][0].shape)
+# taking adapter wise average for each block for each domain
+# for domain_idx, domain in enumerate(train_domains):
+    module_index = 0
+    for name, module in model.named_modules():
+        
+        if isinstance(module, peft.tuners.lora.layer.Linear):
+            # print("Module",module.attn_scores)
+            # domain_softmax = module.attn_scores
+            # if name.endswith('attn_scores'):
+            #     print(name)
+            prefix = f'resblocks.{module_index}.attn.' + 'q_proj'
+            
+            if name.endswith(prefix):
+                # print(module.attn_scores)
+                print(name)
+                domain_softmax = module.attn_scores
+                # print(domain_softmax.shape)
+                # print(module.hopfield_keys.shape)
+                # exit(0)
+                # print("Hey")
+                block_wise_softmax[f'{module_index}'].append(domain_softmax.detach().cpu())
+            
+                module_index += 1
+
+for block_key in block_wise_softmax:
+    print(len(block_key))
+# exit()
+def parse_block_num(block_key: str) -> int:
+    """Extract the integer block number from keys like '#1', '#12', etc."""
+    m = re.search(r'\d+', block_key)
+    if not m:
+        raise ValueError(f"Block key '{block_key}' does not contain a number.")
+    return int(m.group())
+
+def plot_block_domain_means(
+    adapters_dict: Dict[str, List[torch.Tensor]],
+    out_dir: str = "plots",
+    y_label: str = "Mean over batch",
+    dpi: int = 150
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Sort blocks numerically based on their key (e.g., '#1', '#2', ...)
+    sorted_items = sorted(adapters_dict.items(), key=lambda kv: parse_block_num(kv[0]))
+
+    total_plots = 0
+    for block_key, domain_tensors in sorted_items:
+        block_num = parse_block_num(block_key)
+
+        if not isinstance(domain_tensors, (list, tuple)):
+            raise TypeError(f"Value for block '{block_key}' must be a list/tuple of 6 tensors.")
+
+        if len(domain_tensors) != 6:
+            raise ValueError(f"Block '{block_key}' has {len(domain_tensors)} domains; expected 6.")
+
+        for d_idx, t in enumerate(domain_tensors):
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(f"Block '{block_key}', domain {d_idx}: expected torch.Tensor, got {type(t)}")
+
+            if t.ndim != 2:
+                raise ValueError(f"Block '{block_key}', domain {d_idx}: expected shape (batch, num_adapters), got {tuple(t.shape)}")
+
+            # mean over batch dimension -> (num_adapters,)
+            mean_vec = t.mean(dim=0)
+            # Move to CPU numpy
+            mean_np = mean_vec.detach().cpu().numpy().astype(float)
+
+            num_adapters = mean_np.shape[0]
+            x = np.arange(num_adapters)
+
+            # Plot as a simple bar chart (clear & discrete per adapter)
+            fig, ax = plt.subplots(figsize=(8, 4.5), dpi=dpi)
+            ax.bar(x, mean_np)
+            ax.set_title(f"Block {block_num} · Domain {d_idx}")
+            ax.set_xlabel("Adapter index")
+            ax.set_ylabel(y_label)
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(i) for i in x], rotation=0)
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+            filename = os.path.join(out_dir, f"block{block_num:02d}_domain{d_idx}.png")
+            plt.tight_layout()
+            plt.savefig(filename)
+            plt.close(fig)
+
+            total_plots += 1
+
+    print(f"Saved {total_plots} plots to: {os.path.abspath(out_dir)}")
+    
+
+plot_block_domain_means(adapters_dict=block_wise_softmax, out_dir="plots")
+
+
+exit(0)
 # print("Training completed.")
 import pickle as pkl
 

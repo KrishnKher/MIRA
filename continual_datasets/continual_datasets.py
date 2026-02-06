@@ -320,6 +320,7 @@ class SVHN(datasets.SVHN):
 class CORe50(torch.utils.data.Dataset):
     def __init__(self, root, train=True, transform=None, target_transform=None, download=False, mode='cil'):        
         self.root = os.path.expanduser(root)
+        print("Root is " ,self.root)
         self.transform = transform
         self.target_transform=target_transform
         self.train = train
@@ -362,6 +363,8 @@ class CORe50(torch.utils.data.Dataset):
         else:
             fpath = self.fpath + '/test'
             self.data = datasets.ImageFolder(fpath, transform=transform)
+        
+        print("Printing length of data: ", len(self.data))
 
     def split(self):
         train_folder = self.fpath + '/train'
@@ -419,9 +422,11 @@ class CORe50(torch.utils.data.Dataset):
 
 class DomainNet(torch.utils.data.Dataset):
     def __init__(self, root, train=True, transform=None, target_transform=None, download=False, mode='cil'):
-        root = os.path.join(root, 'VIL_DomainNet')   
+        # root = os.path.join(root, 'VIL_DomainNet')   
         # root = os.path.join(root, 'DomainNet')   
         self.root = os.path.expanduser(root)
+        print(self.root)
+        # exit(0)
         self.transform = transform
         self.target_transform=target_transform
         self.train = train
@@ -472,24 +477,24 @@ class DomainNet(torch.utils.data.Dataset):
             'http://csr.bu.edu/ftp/visda/2019/multi-source/txt/sketch_test.txt'
         ]
 
-        for u in self.test_url_list:
-            filename = u.split('/')[-1]
-            if not os.path.isfile(os.path.join(self.root, filename)):
-                if not download:
-                    raise RuntimeError('Dataset not found. You can use download=True to download it')
-                else:
-                    print('Downloading from '+filename)
-                    download_url(u, root, filename=filename)
+        # for u in self.test_url_list:
+        #     filename = u.split('/')[-1]
+        #     if not os.path.isfile(os.path.join(self.root, filename)):
+        #         if not download:
+        #             raise RuntimeError('Dataset not found. You can use download=True to download it')
+        #         else:
+        #             print('Downloading from '+filename)
+        #             download_url(u, root, filename=filename)
 
         self.fpath = [os.path.join(self.root, f) for f in self.filename]
 
-        for i in range(len(self.fpath)):
-            if not os.path.isfile(self.fpath[i]):
-                if not download:
-                    raise RuntimeError('Dataset not found. You can use download=True to download it')
-                else:
-                    print('Downloading from '+self.url[i])
-                    download_url(self.url[i], root, filename=self.filename[i])
+        # for i in range(len(self.fpath)):
+        #     if not os.path.isfile(self.fpath[i]):
+        #         if not download:
+        #             raise RuntimeError('Dataset not found. You can use download=True to download it')
+        #         else:
+        #             print('Downloading from '+self.url[i])
+        #             download_url(self.url[i], root, filename=self.filename[i])
 
         if not os.path.exists(self.root + '/train') and not os.path.exists(self.root + '/test'):
             for i in range(len(self.fpath)):
@@ -509,11 +514,15 @@ class DomainNet(torch.utils.data.Dataset):
                 self.data = [datasets.ImageFolder(f'{fpath}/{d}', transform=transform) for d in ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']]
             else:
                 self.data = datasets.ImageFolder(fpath, transform=transform)
+            
+            print("Data is ", self.data)
         else:
             fpath = self.root + '/test'
+            print("Mode is ", self.mode)
             if self.mode not in ['cil', 'joint']:
                 self.data = [datasets.ImageFolder(f'{fpath}/{d}', transform=transform) for d in ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']]
             else:
+                # print()
                 self.data = datasets.ImageFolder(fpath, transform=transform)
 
     def split(self):

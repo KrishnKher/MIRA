@@ -407,7 +407,7 @@ elif dataset_name == "DomainNet-dil":
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
-    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt')
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt')
     # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_stage1_saksham_1.pt', weights_only=False)
     # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom.pt')
     # print("ADapter list", adapter_list)

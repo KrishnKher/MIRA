@@ -81,18 +81,91 @@ dataset_name = args.dataset
 if dataset_name == "PACS":
     dataset = load_dataset("flwrlabs/pacs")
     train_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
+    if args.base_model == 'vit-in21k':
+        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
+        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
+        
+        preprocess_train = Compose([
+                RandomResizedCrop(
+                    size=(224, 224),
+                    scale=(0.9, 1.0),
+                    ratio=(0.75, 1.3333),
+                    interpolation=InterpolationMode.BICUBIC,
+                    antialias=True
+                ),
+                RandomHorizontalFlip(p=0.5),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
+        
+        preprocess_val = Compose([
+                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+                CenterCrop((224, 224)),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
 elif dataset_name == "DomainNet":
     dataset = load_dataset("wltjr1007/DomainNet")
     train_domains = [0, 1, 2, 3, 4, 5]
 elif dataset_name == "OfficeHome":
     dataset = load_dataset("flwrlabs/office-home")
     train_domains = ['Art', 'Clipart', 'Product', 'Real World']
+    if args.base_model == 'vit-in21k':
+        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
+        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
+        
+        preprocess_train = Compose([
+                RandomResizedCrop(
+                    size=(224, 224),
+                    scale=(0.9, 1.0),
+                    ratio=(0.75, 1.3333),
+                    interpolation=InterpolationMode.BICUBIC,
+                    antialias=True
+                ),
+                RandomHorizontalFlip(p=0.5),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
+        
+        preprocess_val = Compose([
+                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+                CenterCrop((224, 224)),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
 elif dataset_name == "VLCS":
     train_domains = ['Caltech101', 'LabelMe', 'SUN09', 'VOC2007']
     try:
         dataset = load_dataset("ai22mtech12002/DG_VLCS")
     except:
         dataset = make_VLCS('data/VLCS')
+        
+    if args.base_model == 'vit-in21k':
+        ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
+        mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
+        std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
+        
+        preprocess_train = Compose([
+                RandomResizedCrop(
+                    size=(224, 224),
+                    scale=(0.9, 1.0),
+                    ratio=(0.75, 1.3333),
+                    interpolation=InterpolationMode.BICUBIC,
+                    antialias=True
+                ),
+                RandomHorizontalFlip(p=0.5),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
+        
+        preprocess_val = Compose([
+                Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
+                CenterCrop((224, 224)),
+                ToTensor(),
+                Normalize(mean=mean, std=std),
+            ])
 elif dataset_name == "TI":
     try:
         dataset = load_dataset("ai22mtech12002/DG_TI")
@@ -361,7 +434,7 @@ class DomainDataset(torch.utils.data.Dataset):
         # item['image'].verify()
         if is_hf_dataset:
             if args.base_model == 'vit-in21k':
-                item['image'] = self.vit_preprocess(item['image'])
+                item['image'] = self.preprocess(item['image'])
             else:
                 item['image'] = self.preprocess(item['image'])
             return {'image': item['image'], 'label': item['label']}
@@ -584,7 +657,7 @@ for did, domain_name in enumerate(train_domains):
         
         print("Verifying saved weights...")
         
-        all_accs = eval(domain_name)
+        all_accs = eval(did)
         print()
 
 

@@ -31,9 +31,10 @@ import random
 import re
 from typing import Optional
 from torch import Tensor
-import peft
 from peft import LoraConfig, get_peft_model
 from transformers import AutoImageProcessor
+from torchvision.transforms import InterpolationMode, CenterCrop, Compose, Resize, RandomCrop, RandomHorizontalFlip, Normalize, RandomResizedCrop, ToPILImage, ToTensor
+import peft
 
 
 
@@ -66,7 +67,6 @@ elif args.separation_function == 'sigmoid':
     args.separation_function = lambda x, dim: torch.sigmoid(x)
 elif args.separation_function == 'tanh':
     args.separation_function = lambda x, dim: torch.tanh(x)
-
 
 def replace_layers(model, trainable, freeze_base=None, freeze_linear_base=None, freeze_lnorm=False):
     # print(model)
@@ -213,55 +213,21 @@ class CustomAttention(nn.Module):
 def replace_attention_with_custom(model, lora_cfg=None):
     replace_layers(model, True)
 
+dataset_name = args.dataset
+is_hf_dataset = True
+
 if args.base_model == 'laion':
     laion, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K')
     vit = laion.visual.cuda()
-
-    hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_laion_DomainNet-dilstage_1_laion_withadapters_witheval.pt')
-    hopfield_values = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_values_laion_DomainNet-dilstage_1_laion_withadapters_witheval.pt')
-    
-    model = deepcopy(vit)
-    replace_attention_with_custom(model)
-    lora_cfg = LoraConfig(
-    r=32,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj"], 
-    lora_dropout=0.0,
-    bias="none",
-    # task_type="FEATURE_EXTRACTION"
-    )
-    
-    print(model)
-    model = get_peft_model(model, lora_cfg)
-    classifier = nn.Linear(512, args.num_classes, bias=False).cuda()
-    
 
 
 elif args.base_model == 'vit-in21k':
     vit = ViT_Pretrained.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=args.num_classes).cuda()
     model_string = 'google/vit-base-patch16-224-in21k'
-    
-    hopfield_keys = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_keys_vit-in21k_DomainNet-dilcls_tokens.pt')
-    hopfield_values = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/hopfield_values_vit-in21k_DomainNet-dilcls_tokens.pt')
-
-    # model_string = 'google/vit-base-patch16-224-in21k'
     preprocess_train = ViTFeatureExtractor.from_pretrained(model_string)
     preprocess_val = preprocess_train
-    lora_cfg = LoraConfig(
-        r=32,
-        lora_alpha=32,
-        target_modules=["query", "value"],
-        modules_to_save=["classifier"],
-        lora_dropout=0.0,
-        bias="none",
-    )
-    model = deepcopy(vit)
-    model = get_peft_model(model, lora_cfg)
-    classifier = nn.Linear(768, args.num_classes, bias=False).cuda()
-    # classifier.load_state_dict(last_head.state_dict())
-    model.classifier = model.model.classifier = nn.Identity()
-dataset_name = args.dataset
-is_hf_dataset = True
+
+
 if dataset_name == "PACS":
     dataset = load_dataset("flwrlabs/pacs")
     train_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
@@ -313,37 +279,13 @@ elif dataset_name == "iDigits-dil":
             ToTensor(),
             Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    if args.base_model == 'vit-b32':
-            ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-            std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-            
-            preprocess_train = Compose([
-                    RandomResizedCrop(
-                        size=(224, 224),
-                        scale=(0.9, 1.0),
-                        ratio=(0.75, 1.3333),
-                        interpolation=InterpolationMode.BICUBIC,
-                        antialias=True
-                    ),
-                    RandomHorizontalFlip(p=0.5),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
-            
-            preprocess_val = Compose([
-                    Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                    CenterCrop((224, 224)),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
-    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/shared_adapter_laion_iDigits-dil_shared_idigit_dil_saksham_2.pt')
+    adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_iDigits-dil.pt')
 elif dataset_name == "CORe50-dil":
     args.num_tasks = 8
-    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/Core50/'
+    args.data_path = '/data1/ai22mtech12002/projects/WeightDG/data/Core50-dil'
     args.task_type = 'dil'
     args.shuffle = True
     args.versatile_inc = False
@@ -360,46 +302,20 @@ elif dataset_name == "CORe50-dil":
             ToTensor(),
             Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]),
         ])
-    if args.base_model == 'vit-b32':
-            ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-            std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-            
-            preprocess_train = Compose([
-                    RandomResizedCrop(
-                        size=(224, 224),
-                        scale=(0.9, 1.0),
-                        ratio=(0.75, 1.3333),
-                        interpolation=InterpolationMode.BICUBIC,
-                        antialias=True
-                    ),
-                    RandomHorizontalFlip(p=0.5),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
-            
-            preprocess_val = Compose([
-                    Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                    CenterCrop((224, 224)),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
-
     dataloaders, _, _ = build_continual_dataloader(args=args)
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
-    # adapter_list = torch.load('/data1/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_CORe50-dil.pt')
+    adapter_list = torch.load('/data1/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_CORe50-dil.pt')
 elif dataset_name == "DomainNet-dil":
     args.num_tasks = 6
-    # args.data_path = os.path.join(os.environ['WORK'], 'data/DomainNet-dil')
-    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/DomainNet-dil/'
-
+    args.data_path = '/data/ai22mtech12002/projects/WeightDG/data/DomainNet-dil'
     args.task_type = 'dil'
     args.shuffle = True
     args.versatile_inc = False
     args.num_workers = 8
     args.pin_mem = True
     if args.base_model == 'vit-in21k':
+        print("Using vit-in21k preprocessing")
         ip = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
         img_mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
         img_std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
@@ -422,30 +338,6 @@ elif dataset_name == "DomainNet-dil":
             ToTensor(),
             Normalize(mean=img_mean, std=img_std)
         ])
-    elif args.base_model == 'vit-b32':
-            ip = AutoImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-            mean = ip.image_mean if hasattr(ip, "image_mean") else [0.5, 0.5, 0.5]
-            std  = ip.image_std  if hasattr(ip, "image_std")  else [0.5, 0.5, 0.5]
-            
-            preprocess_train = Compose([
-                    RandomResizedCrop(
-                        size=(224, 224),
-                        scale=(0.9, 1.0),
-                        ratio=(0.75, 1.3333),
-                        interpolation=InterpolationMode.BICUBIC,
-                        antialias=True
-                    ),
-                    RandomHorizontalFlip(p=0.5),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
-            
-            preprocess_val = Compose([
-                    Resize(size=(256, 256), interpolation=InterpolationMode.BICUBIC, antialias=True),
-                    CenterCrop((224, 224)),
-                    ToTensor(),
-                    Normalize(mean=mean, std=std),
-                ])
     else:
         preprocess_train = Compose([
                 RandomResizedCrop(size=(224, 224), scale=(0.9, 1.0), ratio=(0.75, 1.3333), interpolation=InterpolationMode.BICUBIC, antialias=True),
@@ -462,8 +354,11 @@ elif dataset_name == "DomainNet-dil":
     train_domains = list(range(args.num_tasks))
     is_hf_dataset = False
     # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt')
-    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_mira_32rank_1.pt', weights_only=False)
-    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dilstage_1_with_hopfield_3008.pt', weights_only=False)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_stage1_saksham_1.pt', weights_only=False)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom.pt')
+    # print("ADapter list", adapter_list)
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt')
+    # adapter_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/shared_adapters_list_laion_DomainNet-dil_peft_saksham_shared_with_model.pt')
     
 # CIL Datasets
 elif args.dataset == "cifar100":
@@ -517,15 +412,31 @@ elif args.dataset == "inetR":
 
     is_hf_dataset = False
 
-criterion = nn.CrossEntropyLoss()
-first_accs = {}
 
-adapters_per_domain = args.adapters_per_domain
+# laion, preprocess_train, preprocess_val = open_clip.create_model_and_transforms('hf-hub:laion/CLIP-ViT-B-16-laion2B-s34B-b88K')
+# vit = laion.visual.cuda()
+
+
+
+
+
+# model = VisionTransformer(
+#     224, 16, 768, 12, 12, 4
+# ).cuda()
+# # classifier = nn.Linear(512, args.num_classes, bias=False).cuda()
+# load_laion_weights(model, vit)
+
 epochs = args.epochs
 batch_size = args.batch_size
 num_classes = args.num_classes
 parent_dir = f'data/{dataset_name}'
 os.makedirs(parent_dir, exist_ok=True)
+
+
+# classifier = nn.Linear(512, num_classes).cuda()
+# # schd = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-3)
+criterion = nn.CrossEntropyLoss()
+# first_accs = {}
 
 
 class DomainDataset(torch.utils.data.Dataset):
@@ -573,36 +484,41 @@ class DomainDataset(torch.utils.data.Dataset):
             return item
 
 
-# Function to implement mixup, mixing different parts from all images in the batch
-def mixup(image_batch, mixup_times=1):
-    alpha = 0.4
-    for i in range(mixup_times):
-        lam = np.random.beta(alpha, alpha)
-        rand_perm = torch.randperm(image_batch.size(0))
-        image_batch = lam * image_batch + (1 - lam) * image_batch[rand_perm]
-    return image_batch
-
 
 @torch.no_grad()
 def eval():
     model.eval()
-    class_list = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_vit-in21k_DomainNet-dilcls_tokens.pt', weights_only=False)
     domain_accs = {}
+    domain_indices = list(range(len(test_domain_loaders)))
+    random.shuffle(domain_indices)
+
+# Function to get a unique random domain index
+    def get_unique_random_domain():
+        if not domain_indices:
+            raise ValueError("No more domains left to sample.")
+        return domain_indices.pop()
+
+    
     for domain_idx, test_loader in enumerate(test_domain_loaders):
-        classifier.load_state_dict(class_list[domain_idx].state_dict())
+        # rand_domain = get_unique_random_domain()
+        # weight_dict = list_model[domain_idx]
+        # set_peft_lora_weights(weight_dict)
+        # set_peft_lora_weights_hf_vit(weight_dict)
+        # set_store_dict(vit, weight_dict)
+        
+        
         pbar = Progbar(len(test_loader))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # vit.to(device)
         for step, batch in enumerate(test_loader):
-            pixel_values = batch['image'].cuda()
+            # print(type(batch['image']))
+            pixel_values = batch["image"].cuda()
             labels = batch['label'].cuda()
-            if args.base_model == 'laion':
+            if args.base_model == 'vit-in21k':
+                out = model(pixel_values)
+                outputs = out.logits
+            else:
                 outputs = classifier(model(pixel_values))
-            elif args.base_model == 'vit-in21k':
-                out = model(pixel_values)
-                outputs = classifier(out.logits)
-            elif args.base_model == 'vit-b32':
-                out = model(pixel_values)
-                pooled_output = out.pooler_output
-                outputs = classifier(pooled_output)
             loss = criterion(outputs, labels)
 
             acc = (outputs.argmax(dim=1) == labels).float().mean().item()
@@ -612,70 +528,13 @@ def eval():
             return domain_accs
     return domain_accs
 
+
+
 test_domain_loaders = []
-domain_adapters = {}
-args.num_tasks = 6
-train_domains = list(range(args.num_tasks))
-if args.base_model == 'laion':
-    for domain_idx, domain in enumerate(train_domains):
-        domain_adapters[domain_idx] = {
-            "keys_q" : [
-                hopfield_keys[f'resblocks.{i}.attn.q_proj'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_q" : [
-                hopfield_values[f'resblocks.{i}.attn.q_proj'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ],
-            "keys_v" : [
-                hopfield_keys[f'resblocks.{i}.attn.v_proj'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_v" : [
-                hopfield_values[f'resblocks.{i}.attn.v_proj'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ]
-        }
-elif args.base_model == 'vit-in21k':
-    for domain_idx, domain in enumerate(train_domains):
-        domain_adapters[domain_idx] = {
-            "keys_q" : [
-                hopfield_keys[f'encoder.layer.{i}.attention.attention.query'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_q" : [
-                hopfield_values[f'encoder.layer.{i}.attention.attention.query'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ],
-            "keys_v" : [
-                hopfield_keys[f'encoder.layer.{i}.attention.attention.value'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_v" : [
-                hopfield_values[f'encoder.layer.{i}.attention.attention.value'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ]
-        }
-elif args.base_model == 'vit-b32':
-    for domain_idx, domain in enumerate(train_domains):
-        domain_adapters[domain_idx] = {
-            "keys_q" : [
-                hopfield_keys[f'encoder.layers.{i}.self_attn.q_proj'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_q" : [
-                hopfield_values[f'encoder.layers.{i}.self_attn.q_proj'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ],
-            "keys_v" : [
-                hopfield_keys[f'encoder.layers.{i}.self_attn.v_proj'][:, domain_idx :: args.num_tasks]
-                for i in range(12)
-            ],
-            "values_v" : [
-                hopfield_values[f'encoder.layers.{i}.self_attn.v_proj'][domain_idx :: args.num_tasks, :]
-                for i in range(12)
-            ]
-        }
+vit_hopfield_keys = []
+dualGPM = None
+
+test_domain_loaders = []
 for domain_idx, domain in enumerate(train_domains):
     if args.dataset in ['iDigits-dil', 'CORe50-dil', 'DomainNet-dil']:
         dl = dataloaders[domain]
@@ -720,28 +579,139 @@ for domain_idx, domain in enumerate(train_domains):
         test_dataset = DomainDataset(test_dataset, preprocess_val)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
         test_domain_loaders.append(test_loader)
+    
 
 
+import pickle as pkl
+
+
+# model = pkl.load(open(f'{parent_dir}/{args.base_model}_{args.dataset}_{args.name_tag}.pkl', 'rb'))
+# list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil.pt', weights_only = False)
+# list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt', weights_only = False)
+# list_model = torch.load(f'/data/ai22mtech12002/projects/WeightDG/weights/train_domain_adapters_list_vit-in21k_DomainNet-dil_peft_saksham_lora_vit21_98.pt', weights_only = False)
+# # print(len(list_model), type(list_model[0]))
+# print(model)
+# weight_dict = list_model[0]
+# print(model[0])
+# print(model)
+# set_peft_lora_weights(model, model_weights)
+
+# print("a", a)
+# list_classifier = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_vit-in21k_DomainNet-dil_peft_saksham_lora_vit21_98.pt', weights_only = False)
+# list_classifier = torch.load('/data/ai22mtech12002/projects/WeightDG/weights/train_domain_classifiers_laion_DomainNet-dil_peft_saksham_lora_custom_98.pt', weights_only = False)
+# state_dict = torch.load(
+#     '/data/ai22mtech12002/projects/WeightDG/weights/classifier_without_adapters_laion_DomainNet-dilstage_1_laion_withoutadapters_witheval.pt',
+#     map_location="cuda"  
+# )
+
+state_dict = torch.load(
+    'weights/train_domain_classifiers_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt',
+    map_location="cuda",
+    weights_only=False
+)
+last_head = state_dict[5]
+
+
+model = deepcopy(vit)
+
+if args.base_model == 'laion':
+    classifier = nn.Linear(512, args.num_classes, bias=False).cuda()
+    # classifier.load_state_dict(state_dict)
+    replace_attention_with_custom(model)
+    lora_cfg = LoraConfig(
+        r=32,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"], 
+        lora_dropout=0.0,
+        bias="none",
+        # task_type="FEATURE_EXTRACTION"
+    )
+    model = get_peft_model(model, lora_cfg)
+    
+    print(classifier)
+elif args.base_model == 'vit-in21k':
+    lora_cfg = LoraConfig(
+        r=32,
+        lora_alpha=32,
+        target_modules=["query", "value"],
+        modules_to_save=["classifier"],
+        lora_dropout=0.0,
+        bias="none",
+    # task_type="FEATURE_EXTRACTION"
+    )
+    model = get_peft_model(model, lora_cfg)
+    print(model)
+    
+    classifier = nn.Linear(768, args.num_classes, bias=False).cuda()
+    # classifier.load_state_dict(state_dict)
+    model.classifier = classifier
+    
+hopfield_keys = torch.load('weights/hopfield_keys_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
+hopfield_values = torch.load('weights/hopfield_values_vit-in21k_DomainNet-dilstage_1_vitin21k_withadapters_witheval_0409.pt')
+
+    
+
+domain_adapters = {}
+
+# print(hopfield_keys.shape, hopfield_values.shape)
+if args.base_model == 'laion':
+    for domain_idx, domain in enumerate(train_domains):
+        domain_adapters[domain_idx] = {
+            "keys_q" : [
+                hopfield_keys[f'resblocks.{i}.attn.q_proj'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_q" : [
+                hopfield_values[f'resblocks.{i}.attn.q_proj'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ],
+            "keys_v" : [
+                hopfield_keys[f'resblocks.{i}.attn.v_proj'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_v" : [
+                hopfield_values[f'resblocks.{i}.attn.v_proj'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ]
+        }
+elif args.base_model == 'vit-in21k':
+    for domain_idx, domain in enumerate(train_domains):
+        domain_adapters[domain_idx] = {
+            "keys_q" : [
+                hopfield_keys[f'encoder.layer.{i}.attention.attention.query'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_q" : [
+                hopfield_values[f'encoder.layer.{i}.attention.attention.query'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ],
+            "keys_v" : [
+                hopfield_keys[f'encoder.layer.{i}.attention.attention.value'][:, domain_idx :: args.num_tasks]
+                for i in range(12)
+            ],
+            "values_v" : [
+                hopfield_values[f'encoder.layer.{i}.attention.attention.value'][domain_idx :: args.num_tasks, :]
+                for i in range(12)
+            ]
+        }
+
+for domain_idx, domain in enumerate(train_domains):
+    
     keys_q = domain_adapters[domain_idx]["keys_q"]
     keys_v = domain_adapters[domain_idx]["keys_v"]
     
     values_q = domain_adapters[domain_idx]["values_q"]
     values_v = domain_adapters[domain_idx]["values_v"]
-
-
-    epochs = args.epochs if (args.later_epochs is None or domain_idx == 0) else args.later_epochs
-    prev_keys = None
-
-
+    
     keys_new = []
     module_index = 0
     hopfield_query_params = []
 
     for name, module in model.named_modules():
-
+        # print(name)
         if isinstance(module, peft.tuners.lora.layer.Linear):
-
-            # module.use_hopfield = True
+            # print("Found")
+            module.use_hopfield = True
             
             if args.base_model == 'laion':
                 prefix = f'resblocks.{module_index}.attn.' + ('q_proj')
@@ -751,36 +721,43 @@ for domain_idx, domain in enumerate(train_domains):
                 prefix = f'encoder.layer.{module_index}.attention.attention.' + 'query'
                 key_list = keys_q
                 value_list = values_q
-            elif args.base_model == 'vit-b32':
-                prefix = f'encoder.layers.{module_index}.self_attn.' + 'q_proj'
-                key_list = keys_q
-                value_list = values_q
             
 
-
+            # exit()
             if name.endswith(prefix):
-
+                # print(name, module_index, prefix)
+                    
+            # FInding module + prefix attr
+            # for attr in dir(module):
+            #     if 'prefix' in attr:
+            #         print(attr)
+            # print(module.prefix.hopfield_keys if hasattr(module.prefix, 'hopfield_keys') else "No prefix", prefix)
+                # if module.hopfield_keys is None:
+                #     module.hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda().clone().detach())
+                #     module.hopfield_values = value_list[module_index]
+                # else:
+                #     module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, torch.ones_like(key_list[module_index]).cuda()], dim=1).cuda().clone().detach())
+                #     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
+                # keys_new.append(module.hopfield_keys)
+                # print(module)
+                hopfield_keys = nn.Parameter(torch.ones_like(key_list[module_index]).cuda())
                 if module.hopfield_keys is None:
-
-                    module.hopfield_keys = nn.Parameter(key_list[module_index].cuda().clone().detach())
-                    module.hopfield_keys.requires_grad = True
+                    module.hopfield_keys = torch.cat([hopfield_keys], dim=1)
                     module.hopfield_values = value_list[module_index]
                 else:
-
-                    module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, key_list[module_index].cuda()], dim=1).cuda().clone().detach())
-                    module.hopfield_keys.requires_grad = True
+                    module.hopfield_keys = torch.cat([module.hopfield_keys, hopfield_keys], dim=1)
                     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
                 
                 module_index += 1
-                keys_new.append(module.hopfield_keys)
+                keys_new.append(hopfield_keys)
         # exit()
     module_index = 0
     
     for name, module in model.named_modules():
-
+        # print(name)
         if isinstance(module, peft.tuners.lora.layer.Linear):
-
-            # module.use_hopfield = True
+            # print("Found")
+            module.use_hopfield = True
             
             if args.base_model == 'laion':
                 prefix = f'resblocks.{module_index}.attn.' + ('v_proj')
@@ -790,51 +767,34 @@ for domain_idx, domain in enumerate(train_domains):
                 prefix = f'encoder.layer.{module_index}.attention.attention.' + 'value'
                 key_list = keys_v
                 value_list = values_v
-            elif args.base_model == 'vit-b32':
-                prefix = f'encoder.layers.{module_index}.self_attn.' + 'v_proj'
-                key_list = keys_v
-                value_list = values_v
             
 
-
+            # exit()
             if name.endswith(prefix):
+                # print(name, module_index, prefix)
+                    
+            # FInding module + prefix attr
+            # for attr in dir(module):
+            #     if 'prefix' in attr:
+            #         print(attr)
+            # print(module.prefix.hopfield_keys if hasattr(module.prefix, 'hopfield_keys') else "No prefix", prefix)
                 if module.hopfield_keys is None:
-                    module.hopfield_keys = nn.Parameter(key_list[module_index].cuda().clone().detach(), requires_grad=True)
-                    # module.hopfield_keys.requires_grad = True
+                    module.hopfield_keys = nn.Parameter(key_list[module_index].cuda().clone().detach())
                     module.hopfield_values = value_list[module_index]
                 else:
-                    module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, key_list[module_index].cuda()], dim=1).cuda().clone().detach(), requires_grad=True)
-                    # module.hopfield_keys.requires_grad = True
+                    module.hopfield_keys = nn.Parameter(torch.cat([module.hopfield_keys, key_list[module_index].cuda()], dim=1).cuda().clone().detach())
                     module.hopfield_values = torch.cat([module.hopfield_values, value_list[module_index].cuda()], dim=0)
                 # print(module)
                 module_index += 1
                 keys_new.append(module.hopfield_keys)
 
-
-eval()
-
-# with torch.no_grad():
-#     dummy_input = torch.randn(400, 1, 3, 224, 224).cuda()
-#     time_array = []
-#     for i in range(400):
-#         start = time.time()
-#         _ = model(dummy_input[i])
-#         end = time.time()
-#         time_array.append(end - start)
-#     print(f"Average time taken for forward pass: {sum(time_array) / len(time_array):.4f} seconds")
+    # epochs = args.epochs if (args.later_epochs is None or domain_idx == 0) else args.later_epochs
 
 
 
 
+print(model)
 
 
-
-
-
-
-
-
-
-
-
-
+eval_accs = eval()
+print("Final eval accs: ", eval_accs)
